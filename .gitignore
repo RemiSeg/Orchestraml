@@ -34,3 +34,7 @@ setup.log
 
 # Local OPAM switch
 _opam/
+
+# Local development and editor artifacts
+.opam-switch/
+*.merlin-conf

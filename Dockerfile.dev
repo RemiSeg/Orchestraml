@@ -1,0 +1,8 @@
+FROM ocaml/opam:debian-12-ocaml-5.2@sha256:fb0e032e3b8d6e0119e8d35f5c9663f7fa90ac356ac79ed632c0f561624bcb62
+
+WORKDIR /workspace
+COPY --chown=opam:opam orchestraml.opam dune-project ./
+RUN opam install . --deps-only --with-test --yes
+
+COPY --chown=opam:opam . .
+CMD ["opam", "exec", "--", "dune", "runtest"]

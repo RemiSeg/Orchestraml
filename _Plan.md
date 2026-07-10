@@ -572,7 +572,86 @@ Coordinator Starts
  → Reconcile Assigned/Running Attempts
  → Requeue Uncertain Jobs
  → Resume Scheduler
-8. Suggested implementation order
+8. Phase 1 domain foundation design
+
+Purpose
+
+Phase 1 establishes Orchestraml's pure domain rulebook. It contains no HTTP, PostgreSQL, Eio, Docker, environment-variable, or real-clock dependencies. Infrastructure and application layers will consume these rules in later phases.
+
+Domain modules
+
+* Strong UUID-backed `Job_id`, `Worker_id`, and `Attempt_id` types prevent identifiers from being mixed accidentally. Random generation remains outside state-transition functions so tests can use deterministic identifiers.
+* Validated scalar types cover CPU millicores, memory MiB, timeout seconds, retry delays, maximum attempts, concurrency, priority, attempt numbers, job names, and worker labels.
+* Worker labels are normalized and represented as sets. A job's required labels must be a subset of a worker's labels.
+* Private job, attempt, and worker records are created and changed only through validated public functions.
+* Job execution specifications distinguish local commands from container specifications while remaining independent of process and Docker implementations.
+
+State machines
+
+Jobs and attempts use separate state machines. Status values contain no identifiers or timestamps.
+
+Job states:
+
+Pending → Assigned → Running → Completed
+Assigned or Running → Retry_waiting → Pending
+Pending or Retry_waiting → Cancelled
+Assigned → Cancelled when execution has not started
+Running → Cancelling → Cancelled
+Assigned or Running → Permanently_failed when retry is forbidden or exhausted
+
+`Completed`, `Permanently_failed`, and `Cancelled` are terminal job states.
+
+Attempt states:
+
+Assigned → Running → Succeeded
+Assigned or Running → Failed, Lost, or Cancelled
+Running → Timed_out
+
+All terminal attempt states are immutable. Validated transition functions return structured errors for forbidden transitions and produce domain events for later persistence by the application layer.
+
+Failure and retry policy
+
+* Failures use structured categories rather than classification based on log text.
+* Worker loss, network interruption, assignment timeout, and temporary execution failures are retryable by default.
+* Invalid commands, missing executables, invalid images or configuration, permission failures, user cancellation, and unknown failures are non-retryable by default.
+* Execution-timeout retry is configurable.
+* `max_attempts` means the total number of executions, including the initial attempt.
+* Retry delay uses deterministic capped exponential backoff. Random jitter is deferred until operational evidence shows it is needed.
+* Retry decisions are pure functions of policy, failure, attempt count, and an explicitly supplied UTC timestamp.
+
+Worker eligibility and scheduling
+
+A worker is eligible only when it is healthy, contains every required label, has a free concurrency slot, and has sufficient unreserved CPU and memory. Eligibility returns structured rejection reasons for diagnostics.
+
+Pending jobs are ordered by higher numeric priority, earlier submission time, then job ID for deterministic ties. Eligible workers are ordered by lowest concurrency utilization, remaining resources, then worker ID. CPU and memory are hard eligibility constraints. Scheduling functions select candidates but do not mutate jobs, reserve capacity, or create attempts.
+
+Testing strategy
+
+Alcotest covers validated constructors, the complete job and attempt transition matrices, terminal-state immutability, failure classification, retry limits and backoff, worker eligibility, and deterministic scheduling examples.
+
+Initial QCheck properties verify that terminal states never transition, retry delays remain capped, retry limits are respected, selected workers are always eligible and within capacity, higher-priority jobs are selected first, and identical inputs always produce identical scheduling decisions.
+
+Implementation increments
+
+1. Dune project skeleton, UUID identifiers, and validated scalar types.
+2. Labels, resources, timestamps, execution specifications, and job, attempt, and worker models.
+3. Separate job and attempt transition functions with complete Alcotest transition matrices.
+4. Structured failures and deterministic retry policy.
+5. Worker eligibility and deterministic job and worker ordering.
+6. QCheck properties, public module documentation, and final Phase 1 verification.
+
+Phase 1 acceptance criteria
+
+* Every public domain module has a documented `.mli` interface.
+* Invalid primitive values and invalid state changes cannot enter through public APIs.
+* Job and attempt transitions are explicit and exhaustively unit tested.
+* Retry, eligibility, and scheduling decisions are deterministic and independently testable.
+* No selected worker can violate label, health, concurrency, CPU, or memory requirements.
+* Terminal job and attempt states cannot become active again.
+* Alcotest and QCheck suites pass through Dune.
+* The complete domain library builds and tests without HTTP, PostgreSQL, Eio, or Docker.
+
+9. Suggested implementation order
 
 The project should be built vertically, not by creating every empty module first.
 
