@@ -10,6 +10,16 @@
   (dune (>= 3.16))
   uuidm
   ptime
+  eio
+  eio_main
+  cohttp-eio
+  caqti
+  caqti-eio
+  caqti-driver-postgresql
+  yojson
+  cmdliner
+  uri
+  base64
   (alcotest :with-test)
   (qcheck :with-test)
   (qcheck-alcotest :with-test)))

@@ -11,5 +11,9 @@ val create : max_attempts:Scalar.Max_attempts.t ->
   maximum_delay:Scalar.Retry_delay_seconds.t -> retry_timeouts:bool ->
   (t, Validation_error.t) result
 val max_attempts : t -> Scalar.Max_attempts.t
+val initial_delay : t -> Scalar.Retry_delay_seconds.t
+val multiplier : t -> int
+val maximum_delay : t -> Scalar.Retry_delay_seconds.t
+val retry_timeouts : t -> bool
 val delay_seconds : t -> attempts_started:int -> int
 val decide : t -> failure:Failure.t -> attempts_started:int -> now:Timestamp.t -> decision

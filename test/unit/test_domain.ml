@@ -147,6 +147,40 @@ let test_scheduler () =
   | Some selected -> Alcotest.(check int) "highest priority" 10 (Job.priority selected |> Scalar.Priority.value)
   | None -> Alcotest.fail "no job selected"
 
+let test_worker_capacity () =
+  let original = worker () in
+  let reserved = Worker.reserve ~requirements:(resources 500 256) original |> Result.get_ok in
+  Alcotest.(check int) "active after reserve" 1 (Worker.active_jobs reserved);
+  Alcotest.(check int) "available cpu" 1500
+    (Worker.available_resources reserved |> Resources.cpu |> Scalar.Cpu_millicores.value);
+  let released = Worker.release ~requirements:(resources 500 256) reserved |> Result.get_ok in
+  Alcotest.(check int) "active after release" 0 (Worker.active_jobs released);
+  Worker.release ~requirements:(resources 500 256) released
+  |> (function Error Worker.Invalid_release -> () | _ -> Alcotest.fail "invalid release accepted")
+
+let test_worker_capacity_rejections () =
+  Worker.reserve ~requirements:(resources 1 1) (worker ~active_jobs:2 ~max_concurrency:2 ())
+  |> (function Error Worker.No_concurrency -> () | _ -> Alcotest.fail "full worker accepted");
+  Worker.reserve ~requirements:(resources 201 1)
+    (worker ~total:(resources 200 200) ())
+  |> (function Error Worker.Insufficient_cpu -> () | _ -> Alcotest.fail "insufficient CPU accepted");
+  Worker.reserve ~requirements:(resources 1 201)
+    (worker ~total:(resources 200 200) ())
+  |> (function Error Worker.Insufficient_memory -> () | _ -> Alcotest.fail "insufficient memory accepted")
+
+let test_persistence_restoration () =
+  let pending = job () in
+  let restored = Job.snapshot pending |> Job.restore |> Result.get_ok in
+  Alcotest.(check string) "job restored" "pending" (Job.status restored |> Job_status.to_string);
+  let invalid : Job.snapshot = { (Job.snapshot pending) with attempts_started = -1 } in
+  (match Job.restore invalid with Error _ -> () | Ok _ -> Alcotest.fail "invalid job restored");
+  let number = int_value Scalar.Attempt_number.create 1 in
+  let assigned = Attempt.create ~id:attempt_id ~job_id ~number ~worker_id ~assigned_at:now in
+  let restored_attempt = Attempt.snapshot assigned |> Attempt.restore |> Result.get_ok in
+  check_attempt_status Attempt_status.Assigned restored_attempt;
+  let invalid_attempt : Attempt.snapshot = { (Attempt.snapshot assigned) with status = Attempt_status.Succeeded } in
+  (match Attempt.restore invalid_attempt with Error _ -> () | Ok _ -> Alcotest.fail "invalid attempt restored")
+
 let () = Alcotest.run "orchestraml-domain" [
   "values", [
     Alcotest.test_case "identifiers" `Quick test_identifiers;
@@ -164,5 +198,8 @@ let () = Alcotest.run "orchestraml-domain" [
     Alcotest.test_case "retry" `Quick test_retry_policy;
     Alcotest.test_case "health and eligibility" `Quick test_health_and_eligibility;
     Alcotest.test_case "scheduler" `Quick test_scheduler;
+    Alcotest.test_case "worker capacity" `Quick test_worker_capacity;
+    Alcotest.test_case "worker capacity rejections" `Quick test_worker_capacity_rejections;
+    Alcotest.test_case "persistence restoration" `Quick test_persistence_restoration;
   ];
 ]

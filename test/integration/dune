@@ -1,0 +1,4 @@
+(executable
+ (name test_postgres)
+ (libraries orchestraml.domain orchestraml.application orchestraml.infrastructure
+   eio_main alcotest))

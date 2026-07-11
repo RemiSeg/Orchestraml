@@ -1,0 +1,4 @@
+(library
+ (name orchestraml_test_support)
+ (wrapped true)
+ (libraries orchestraml.domain orchestraml.application))

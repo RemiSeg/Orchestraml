@@ -2,5 +2,6 @@
 type t = Assigned | Running | Succeeded | Failed | Timed_out | Lost | Cancelled
 val is_terminal : t -> bool
 val to_string : t -> string
+val of_string : string -> (t, Validation_error.t) result
 val equal : t -> t -> bool
 val pp : Format.formatter -> t -> unit

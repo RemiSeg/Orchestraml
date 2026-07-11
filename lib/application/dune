@@ -1,0 +1,7 @@
+(include_subdirs qualified)
+
+(library
+ (name orchestraml_application)
+ (public_name orchestraml.application)
+ (wrapped true)
+ (libraries orchestraml.domain))

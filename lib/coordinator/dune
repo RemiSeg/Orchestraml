@@ -1,0 +1,7 @@
+(include_subdirs qualified)
+
+(library
+ (name orchestraml_coordinator)
+ (public_name orchestraml.coordinator)
+ (wrapped true)
+ (libraries orchestraml.domain orchestraml.application yojson base64 uri cohttp-eio eio))

@@ -17,6 +17,10 @@ let create ~max_attempts ~initial_delay ~multiplier ~maximum_delay ~retry_timeou
   else Ok { max_attempts; initial_delay; multiplier; maximum_delay; retry_timeouts }
 
 let max_attempts value = value.max_attempts
+let initial_delay value = value.initial_delay
+let multiplier value = value.multiplier
+let maximum_delay value = value.maximum_delay
+let retry_timeouts value = value.retry_timeouts
 
 let delay_seconds policy ~attempts_started =
   let cap = Scalar.Retry_delay_seconds.value policy.maximum_delay in

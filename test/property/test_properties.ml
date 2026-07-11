@@ -111,10 +111,25 @@ let terminal_attempts_never_transition =
           Attempt.cancel ~now:timestamp terminal with
     | Error _, Error _, Error _, Error _ -> true | _ -> false)
 
+let worker_capacity_round_trip =
+  QCheck.Test.make ~name:"worker capacity reserve/release round trip"
+    QCheck.(pair (0 -- 2000) (0 -- 2000)) (fun (required_cpu, required_memory) ->
+      let worker = make_worker 1 0 2 2000 2000 in
+      let requirements = resources required_cpu required_memory in
+      match Worker.reserve ~requirements worker with
+      | Error _ -> false
+      | Ok reserved ->
+          match Worker.release ~requirements reserved with
+          | Error _ -> false
+          | Ok released -> Worker.active_jobs released = 0
+            && Scalar.Cpu_millicores.value (Resources.cpu (Worker.available_resources released)) = 2000
+            && Scalar.Memory_mib.value (Resources.memory (Worker.available_resources released)) = 2000)
+
 let () = Alcotest.run "orchestraml-domain-properties" [
   "properties", List.map QCheck_alcotest.to_alcotest [
     retry_delays_are_capped; retry_limit_is_respected; selected_worker_is_eligible;
     higher_priority_wins; deterministic_selection; terminal_jobs_never_reactivate;
     missing_required_labels_prevent_selection; terminal_attempts_never_transition;
+    worker_capacity_round_trip;
   ]
 ]

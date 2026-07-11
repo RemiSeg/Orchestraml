@@ -651,7 +651,195 @@ Phase 1 acceptance criteria
 * Alcotest and QCheck suites pass through Dune.
 * The complete domain library builds and tests without HTTP, PostgreSQL, Eio, or Docker.
 
-9. Suggested implementation order
+9. Phase 2 in-memory vertical prototype design
+
+Purpose
+
+Phase 2 connects the domain rules into a complete single-process job lifecycle. It proves application coordination before HTTP, PostgreSQL, Eio, Docker execution, or the CLI are introduced.
+
+Application structure
+
+The application layer is a separate wrapped OCaml library with three qualified namespaces:
+
+```text
+lib/application/
+├── ports/       Repository, clock, ID generator, and executor contracts
+├── services/    Submission, worker, scheduling, execution, and retry use cases
+└── memory/      In-memory repositories and deterministic test implementations
+```
+
+Dependencies point in one direction:
+
+```text
+Domain ← Application ports ← Application services ← Memory implementations
+```
+
+Public modules retain narrow `.mli` contracts. Each folder has one concise engineering document covering scope, dependencies, public objects, key functions, and non-responsibilities. Trivial helpers remain private rather than becoming new modules.
+
+Application ports
+
+Ports are records of functions so services depend on behavior rather than concrete storage or runtime implementations:
+
+* Job, attempt, worker, and event repositories expose only operations required by current use cases.
+* The clock exposes `now`; services never read the system clock directly.
+* The ID generator supplies job, attempt, and worker identifiers; services never generate randomness directly.
+* The executor accepts a job and attempt and reports success, structured failure, or timeout.
+
+The fake clock, deterministic ID generator, scripted executor, and in-memory repositories are controlled implementations of these ports. They allow immediate time advancement, repeatable identifiers, configured execution outcomes, and lifecycle testing without real infrastructure. Production implementations replace them later without changing application services.
+
+In-memory state
+
+One private store owns jobs, attempts, workers, and transition events. Repository implementations share that store. Expected repository failures use typed results, including not found and duplicate identity errors.
+
+Assignment validates every change before committing the related job, attempt, worker-capacity, and event updates. Phase 2 remains single-threaded and does not introduce a generic transaction framework; PostgreSQL transactions replace this focused in-memory operation in Phase 3.
+
+Application services
+
+* `Job_service` submits validated jobs, stores them, retrieves them, and cancels jobs that are not actively executing.
+* `Worker_service` registers, retrieves, and lists workers.
+* `Scheduling_service` performs one scheduling cycle: select a pending job, select an eligible worker, create an attempt, transition the job, reserve capacity, and persist events.
+* `Execution_service` processes worker start and terminal-result reports, transitions attempt and job outcomes, applies retry policy, releases capacity, and records events. It never executes jobs itself.
+* `Retry_service` performs one retry cycle by releasing jobs whose retry deadline has arrived back to `Pending`.
+
+`No_assignment` and `No_retry_ready` are normal service outcomes, not errors. Services coordinate domain objects but do not duplicate state-transition, eligibility, scheduling, or retry rules.
+
+Required domain extension
+
+Worker capacity gains validated `reserve` and `release` operations. They preserve concurrency, CPU, and memory invariants and are covered by unit and property tests before application services depend on them.
+
+Vertical lifecycle
+
+```text
+Submit job
+→ Register compatible worker
+→ Schedule job and create attempt
+→ Execute configured retryable failure
+→ Store failed attempt and move job to Retry_waiting
+→ Advance controlled clock
+→ Release retry to Pending
+→ Schedule a second attempt
+→ Execute success
+→ Complete job and release worker capacity
+```
+
+Both attempts and every transition event remain available at the end of the scenario. A second scenario proves that a non-retryable failure becomes `Permanently_failed` without another attempt.
+
+Testing and acceptance
+
+* Repository tests cover creation, duplicate rejection, retrieval, updates, pending/retry queries, attempt history, and event ordering.
+* Service tests cover submission, registration, eligibility, assignment, capacity reservation/release, success, retry, permanent failure, cancellation, and empty scheduling cycles.
+* Vertical integration tests cover retry-then-success and immediate permanent failure entirely in memory.
+* Fake time, identifiers, and executor outcomes make tests deterministic and require no waiting or external processes.
+* All Phase 1 unit and property tests remain green.
+* Phase 2 is complete when jobs can be submitted, assigned, executed, completed, failed, and retried in memory while preserving attempts, events, and worker capacity.
+
+Explicit boundaries
+
+Phase 2 adds no HTTP routes, JSON protocol, PostgreSQL code, migrations, Eio fibers, Docker executor, real process execution, log streaming, CLI, or generic dependency-injection framework.
+
+10. Phase 3 coordinator and PostgreSQL preparation
+
+Purpose
+
+Phase 3 turns the application into a durable coordinator service. A client submits and queries jobs through HTTP, PostgreSQL stores accepted state before success is returned, and a restarted coordinator can retrieve the same jobs, attempts, workers, and transition events.
+
+Phase boundary
+
+Phase 3 provides durable state and the job-facing coordinator API. It implements and tests atomic assignment against PostgreSQL but does not start autonomous assignment in the coordinator runtime. Worker registration, polling, acknowledgement, and completion-report HTTP endpoints begin in Phase 4. Reconciliation of uncertain running work begins in Phase 5.
+
+Required compatibility work
+
+PostgreSQL must reconstruct entities in every persisted state. `Job` and `Attempt` therefore gain validated restoration APIs that accept persistence snapshots and reject inconsistent combinations of statuses, timestamps, outcomes, retry data, and attempt counts. `Worker.create` remains the worker restoration path because it already validates stored capacity and reservation state.
+
+Persistence does not bypass private domain records, mutate internal fields, or rebuild current state by replaying events. Transition history remains an audit trail rather than the source of truth.
+
+Production adapters
+
+Phase 3 adds implementations for existing application ports:
+
+* PostgreSQL persistence implements the same repository and unit-of-work contract as memory persistence.
+* A system clock returns current UTC time.
+* A UUID generator supplies production job, attempt, and worker identifiers.
+
+Controlled memory, clock, and identifier implementations remain available for deterministic tests. Runtime composition explicitly selects production adapters.
+
+PostgreSQL transaction mapping
+
+Each `with_transaction` callback uses one checked-out database connection. Successful callbacks commit; persistence failures and application rejection paths roll back. Connections are returned to a bounded pool after commit or rollback.
+
+Transactional assignment locks or claims the selected pending job, rechecks worker eligibility and capacity, creates the attempt, updates job and worker state, and appends transition events in one transaction. Concurrent assignment attempts cannot produce multiple active attempts for one job or over-reserve a worker.
+
+Database schema
+
+Initial migrations create:
+
+* `jobs` for job configuration, current state, retry timing, attempt count, timestamps, and optional idempotency data.
+* `job_required_labels` for normalized job capability requirements.
+* `job_attempts` for individual assignments, worker references, statuses, outcomes, and timestamps.
+* `workers` for registration, heartbeat time, total capacity, reservations, and active-job count.
+* `worker_labels` for advertised worker capabilities.
+* `job_state_transitions` for ordered job and attempt transition audit records.
+
+Logs remain outside Phase 3.
+
+Constraints include foreign keys, non-negative resource checks, valid concurrency and attempt values, unique `(job_id, attempt_number)`, unique ordered transition identity, unique worker labels, a unique idempotency key when present, and at most one assigned or running attempt per job.
+
+Migrations are ordered, immutable SQL files applied before the coordinator serves requests. Integration tests start from an empty database and apply the same migrations used by runtime deployment.
+
+Idempotent submission
+
+Submission accepts an optional validated idempotency key. The database enforces uniqueness. Repeating an equivalent request with the same key returns the original job without creating another record. Reusing the key for a materially different job definition returns a conflict.
+
+The stored idempotency record includes or derives a stable request fingerprint so equivalence is deterministic. Concurrent submissions using the same key produce one committed job.
+
+HTTP and JSON boundary
+
+HTTP request and response DTOs are separate from domain records. Decoders validate JSON shape and construct application/domain values; encoders expose stable external fields and never expose private records, database errors, or internal exceptions.
+
+Initial endpoints:
+
+```text
+POST /v1/jobs
+GET  /v1/jobs
+GET  /v1/jobs/{job_id}
+GET  /v1/jobs/{job_id}/attempts
+GET  /v1/jobs/{job_id}/events
+POST /v1/jobs/{job_id}/cancel
+GET  /health
+```
+
+Job listing supports status filtering, deterministic ordering by creation time and job ID, and bounded pagination. Log and worker-protocol endpoints are not included.
+
+Structured API errors map validation to `400`, missing jobs to `404`, invalid state and idempotency conflicts to `409`, and unexpected storage failures to `500`. Database details and secrets never appear in responses.
+
+Coordinator runtime and configuration
+
+The coordinator executable loads configuration from environment variables, creates the database pool, verifies or applies migrations according to the selected migration policy, wires production ports and services, and starts the HTTP server. It binds to a configurable address with a local-only default during development and shuts down resources cleanly.
+
+Technology selection gate
+
+Before the implementation plan is accepted, current OCaml 5.2-compatible choices must be verified for:
+
+* Eio runtime and HTTP server/client stack.
+* PostgreSQL driver and bounded connection pooling.
+* JSON encoding and decoding.
+* Migration execution.
+* Configuration and command-line startup.
+
+The selected libraries must work together in the pinned Linux toolchain and avoid introducing multiple competing concurrency runtimes.
+
+Testing and acceptance
+
+* Migration tests apply every migration to an empty PostgreSQL database.
+* Repository contract tests run against both memory and PostgreSQL implementations.
+* Transaction tests prove rollback, atomic assignment, idempotent submission, and concurrent-assignment safety.
+* HTTP tests cover valid submission, validation failures, idempotency replay/conflict, listing, pagination, inspection, attempts, events, missing jobs, and pending cancellation.
+* Restart integration tests submit data, stop the coordinator instance, create a new instance against the same database, and confirm that all persisted state remains queryable.
+* All Phase 1 and Phase 2 tests remain green.
+
+Phase 3 is complete when accepted jobs and their history survive coordinator restart, HTTP contracts are stable and tested, and PostgreSQL preserves every application invariant without adding worker execution or recovery behavior from later phases.
+
+11. Suggested implementation order
 
 The project should be built vertically, not by creating every empty module first.
 
@@ -665,20 +853,24 @@ Unit tests
 Initial property-based invariants
 Complete when the core rules build and pass without HTTP, PostgreSQL, Eio, or Docker.
 Phase 2: Single-process prototype
-In-memory repositories
-Scheduler
-Fake workers
-Simulated job execution
-Fake clock and executor interfaces
-Complete when jobs can be submitted, assigned, completed, failed, and retried entirely in memory.
+Repository, clock, ID generator, and executor ports
+Shared private in-memory store and repository implementations
+Job, worker, scheduling, execution, and retry services
+Validated worker capacity reservation and release
+Deterministic clock, identifiers, and scripted executor
+Retry-then-success and permanent-failure lifecycle tests
+Complete when jobs can be submitted, assigned, executed, completed, failed, and retried entirely in memory while preserving attempt history, transition events, and worker capacity.
 Phase 3: Coordinator API and database
-HTTP API
-PostgreSQL repositories
-Job submission
-Status queries
-Atomic assignment
-Idempotent submission
-Complete when accepted jobs and their history survive a coordinator restart.
+Validated restoration of persisted jobs and attempts
+Ordered SQL migrations and database constraints
+PostgreSQL repositories, transaction mapping, and connection pooling
+Production UTC clock and UUID generation
+Versioned HTTP API and explicit JSON DTOs
+Submission, listing, pagination, inspection, attempt/event history, and pending cancellation
+Equivalent-request idempotency replay and conflicting-request rejection
+PostgreSQL atomic-assignment and concurrent-submission tests
+Coordinator process configuration and restart integration test
+Complete when accepted jobs and their history survive coordinator restart and remain queryable through the tested HTTP API.
 Phase 4: Real worker agent
 Registration
 Heartbeats

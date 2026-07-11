@@ -1,0 +1,4 @@
+(test
+ (name test_coordinator)
+ (libraries orchestraml.domain orchestraml.application orchestraml.coordinator
+   orchestraml_test_support alcotest yojson))
