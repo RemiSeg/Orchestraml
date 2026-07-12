@@ -29,6 +29,14 @@ let reserved_resources value = value.reserved_resources
 let available_resources value = value.available_resources
 let last_heartbeat value = value.last_heartbeat
 let free_slots value = Scalar.Concurrency.value value.max_concurrency - value.active_jobs
+let reconfigure ~name ~labels ~max_concurrency ~total_resources value =
+  create ~id:value.id ~name ~labels ~max_concurrency ~active_jobs:value.active_jobs
+    ~total_resources ~reserved_resources:value.reserved_resources
+    ~last_heartbeat:value.last_heartbeat
+let heartbeat ~now value =
+  if Timestamp.compare now value.last_heartbeat < 0 then
+    Error (Validation_error.make ~field:"heartbeat" "cannot precede the previous heartbeat")
+  else Ok { value with last_heartbeat = now }
 
 let reserve ~requirements value =
   if free_slots value <= 0 then Error No_concurrency

@@ -20,3 +20,7 @@ val last_heartbeat : t -> Timestamp.t
 val free_slots : t -> int
 val reserve : requirements:Resources.t -> t -> (t, capacity_error) result
 val release : requirements:Resources.t -> t -> (t, capacity_error) result
+val reconfigure : name:string -> labels:Worker_label.Set.t ->
+  max_concurrency:Scalar.Concurrency.t -> total_resources:Resources.t -> t ->
+  (t, Validation_error.t) result
+val heartbeat : now:Timestamp.t -> t -> (t, Validation_error.t) result

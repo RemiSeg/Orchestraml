@@ -3,7 +3,9 @@ type error = Start_error of Services.Execution_service.error
   | Report_error of Services.Execution_service.error | Executor_exhausted of string
 let run ~execution_service ~executor (assignment : Services.Scheduling_service.assignment) =
   let attempt_id = Orchestraml_domain.Core.Attempt.id assignment.attempt in
-  match Services.Execution_service.start_attempt execution_service attempt_id with
+  match Services.Execution_service.acknowledge_attempt execution_service attempt_id with
+  | Error error -> Error (Start_error error)
+  | Ok _ -> match Services.Execution_service.start_attempt execution_service attempt_id with
   | Error error -> Error (Start_error error)
   | Ok _ -> match Scripted_executor.next executor with
       | Error error -> Error (Executor_exhausted error)

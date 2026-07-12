@@ -5,4 +5,5 @@ COPY --chown=opam:opam orchestraml.opam dune-project ./
 RUN opam install . --deps-only --with-test --yes
 
 COPY --chown=opam:opam . .
+RUN opam exec -- dune build @all
 CMD ["opam", "exec", "--", "dune", "runtest"]

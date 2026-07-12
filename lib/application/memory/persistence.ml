@@ -12,13 +12,24 @@ module Store = struct
     workers : (Worker_id.t, Worker.t) Hashtbl.t;
     idempotency : (string, string * Job_id.t) Hashtbl.t;
     mutable events : Domain_event.t list;
+    heartbeats : (Worker_id.t, Persistence.heartbeat_report) Hashtbl.t;
+    controls : (Attempt_id.t, Persistence.control_request) Hashtbl.t;
+    missing_since : (Attempt_id.t, Timestamp.t) Hashtbl.t;
+    claimed_assignments : (Attempt_id.t, Timestamp.t) Hashtbl.t;
+    stop_requests : (string, Persistence.control_request) Hashtbl.t;
   }
   let create () = { jobs = Hashtbl.create 32; attempts = Hashtbl.create 32;
-    workers = Hashtbl.create 16; idempotency = Hashtbl.create 16; events = [] }
+    workers = Hashtbl.create 16; idempotency = Hashtbl.create 16; events = [];
+    heartbeats = Hashtbl.create 16; controls = Hashtbl.create 16;
+    missing_since = Hashtbl.create 16; claimed_assignments = Hashtbl.create 16;
+    stop_requests = Hashtbl.create 16 }
   let snapshot value = { jobs = Hashtbl.copy value.jobs;
     attempts = Hashtbl.copy value.attempts; workers = Hashtbl.copy value.workers;
     idempotency = Hashtbl.copy value.idempotency;
-    events = value.events }
+    events = value.events; heartbeats = Hashtbl.copy value.heartbeats;
+    controls = Hashtbl.copy value.controls; missing_since = Hashtbl.copy value.missing_since;
+    claimed_assignments = Hashtbl.copy value.claimed_assignments;
+    stop_requests = Hashtbl.copy value.stop_requests }
   let replace target source =
     Hashtbl.clear target;
     Hashtbl.iter (Hashtbl.replace target) source
@@ -27,6 +38,11 @@ module Store = struct
     replace value.attempts saved.attempts;
     replace value.workers saved.workers;
     replace value.idempotency saved.idempotency;
+    replace value.heartbeats saved.heartbeats;
+    replace value.controls saved.controls;
+    replace value.missing_since saved.missing_since;
+    replace value.claimed_assignments saved.claimed_assignments;
+    replace value.stop_requests saved.stop_requests;
     value.events <- saved.events
   let jobs value = value.jobs
   let attempts value = value.attempts
@@ -52,6 +68,9 @@ let repositories store =
     if Hashtbl.mem table id then (Hashtbl.replace table id value; Ok ())
     else Error (missing entity id_string) in
   let all table = Hashtbl.fold (fun _ value values -> value :: values) table [] in
+  let rec take count = function
+    | _ when count <= 0 -> [] | [] -> []
+    | value :: rest -> value :: take (count - 1) rest in
   let job_repository : Persistence.job_repository = {
     create_job = (fun job -> let id = Job.id job in
       create jobs Persistence.Job id (Job_id.to_string id) job);
@@ -98,6 +117,11 @@ let repositories store =
     list_retry_ready_jobs = (fun ~now -> Ok (all jobs |> List.filter (fun job ->
       Job_status.equal (Job.status job) Job_status.Retry_waiting
       && match Job.next_retry_at job with Some at -> Timestamp.compare at now <= 0 | None -> false)));
+    list_retry_ready_jobs_bounded = (fun ~now ~limit -> Ok (all jobs |> List.filter (fun job ->
+      Job_status.equal (Job.status job) Job_status.Retry_waiting
+      && match Job.next_retry_at job with Some at -> Timestamp.compare at now <= 0 | None -> false)
+      |> List.sort (fun a b -> Option.compare Timestamp.compare (Job.next_retry_at a) (Job.next_retry_at b))
+      |> take limit));
   } in
   let attempt_repository : Persistence.attempt_repository = {
     create_attempt = (fun attempt -> let id = Attempt.id attempt in
@@ -108,14 +132,46 @@ let repositories store =
     list_attempts_for_job = (fun job_id -> Ok (all attempts |> List.filter
       (fun attempt -> Job_id.equal (Attempt.job_id attempt) job_id) |> List.sort
       (fun left right -> Scalar.Attempt_number.compare (Attempt.number left) (Attempt.number right))));
+    list_active_attempts_for_worker = (fun worker_id -> Ok (all attempts |> List.filter (fun attempt ->
+      Worker_id.equal worker_id (Attempt.worker_id attempt)
+      && (Attempt_status.equal (Attempt.status attempt) Attempt_status.Assigned
+          || Attempt_status.equal (Attempt.status attempt) Attempt_status.Running))));
+    list_expired_unacknowledged = (fun ~before ~limit -> Ok (all attempts |> List.filter (fun attempt ->
+      Attempt_status.equal (Attempt.status attempt) Attempt_status.Assigned
+      && Attempt.acknowledged_at attempt = None
+      && Timestamp.compare (Attempt.assigned_at attempt) before <= 0)
+      |> List.sort (fun a b -> Timestamp.compare (Attempt.assigned_at a) (Attempt.assigned_at b))
+      |> take limit));
+    list_overdue_running = (fun ~now ~grace_seconds ~limit -> Ok (all attempts |> List.filter (fun attempt ->
+      match Attempt.started_at attempt, Hashtbl.find_opt jobs (Attempt.job_id attempt) with
+      | Some started, Some job when Attempt_status.equal (Attempt.status attempt) Attempt_status.Running ->
+          let timeout = Scalar.Timeout_seconds.value (Job.timeout job) + grace_seconds in
+          (match Timestamp.add_seconds started timeout with Some deadline -> Timestamp.compare deadline now <= 0 | None -> false)
+      | _ -> false) |> take limit));
+    claim_assigned_attempt = (fun worker_id ~polled_at ->
+      match all attempts |> List.filter (fun attempt -> Worker_id.equal worker_id (Attempt.worker_id attempt)
+        && Attempt_status.equal (Attempt.status attempt) Attempt_status.Assigned
+        && Attempt.acknowledged_at attempt = None
+        && not (Hashtbl.mem store.claimed_assignments (Attempt.id attempt)))
+        |> List.sort (fun a b -> Timestamp.compare (Attempt.assigned_at a) (Attempt.assigned_at b)) with
+      | [] -> Ok None
+      | attempt :: _ -> Hashtbl.add store.claimed_assignments (Attempt.id attempt) polled_at; Ok (Some attempt));
   } in
   let worker_repository : Persistence.worker_repository = {
     create_worker = (fun worker -> let id = Worker.id worker in
       create workers Persistence.Worker id (Worker_id.to_string id) worker);
+    upsert_worker = (fun worker -> let id = Worker.id worker in
+      let created = not (Hashtbl.mem workers id) in Hashtbl.replace workers id worker; Ok created);
     find_worker = (fun id -> Ok (Hashtbl.find_opt workers id));
+    lock_worker = (fun id -> Ok (Hashtbl.find_opt workers id));
     update_worker = (fun worker -> let id = Worker.id worker in
       update workers Persistence.Worker id (Worker_id.to_string id) worker);
     list_workers = (fun () -> Ok (all workers));
+    store_heartbeat = (fun id report -> if Hashtbl.mem workers id then
+      (Hashtbl.replace store.heartbeats id report; Ok ()) else Error (missing Persistence.Worker (Worker_id.to_string id)));
+    find_heartbeat = (fun id -> Ok (Hashtbl.find_opt store.heartbeats id));
+    list_stale_workers = (fun ~before ~limit -> Ok (all workers |> List.filter
+      (fun worker -> Timestamp.compare (Worker.last_heartbeat worker) before <= 0) |> take limit));
   } in
   let event_repository : Persistence.event_repository = {
     append_event = (fun event -> Store.append_event store event; Ok ());
@@ -123,8 +179,45 @@ let repositories store =
     list_events_for_entity = (fun entity -> Ok (Store.events store |> List.filter
       (fun event -> event_entity_equal event.Domain_event.entity entity)));
   } in
+  let controls : Persistence.control_repository = {
+    create_control = (fun request ->
+      if Hashtbl.mem store.controls request.attempt_id then Ok false
+      else (Hashtbl.add store.controls request.attempt_id request; Ok true));
+    list_controls_for_worker = (fun worker_id ~now ~limit ->
+      let values = (all store.controls @ all store.stop_requests) |> List.filter (fun (request : Persistence.control_request) ->
+        Worker_id.equal worker_id request.worker_id && request.completed_at = None)
+        |> List.sort (fun (a : Persistence.control_request) (b : Persistence.control_request) ->
+          Timestamp.compare a.requested_at b.requested_at) |> take limit in
+      List.iter (fun (request : Persistence.control_request) -> Hashtbl.replace store.controls request.attempt_id
+        { request with delivered_at = Some now }) (List.filter (fun (r : Persistence.control_request) -> r.kind <> Persistence.Stop_unknown) values);
+      List.iter (fun (request : Persistence.control_request) -> Hashtbl.replace store.stop_requests
+        (Worker_id.to_string request.worker_id ^ Attempt_id.to_string request.attempt_id)
+        { request with delivered_at = Some now }) (List.filter (fun (r : Persistence.control_request) -> r.kind = Persistence.Stop_unknown) values);
+      Ok (List.map (fun (request : Persistence.control_request) -> { request with delivered_at = Some now }) values));
+    complete_control = (fun attempt_id ~completed_at -> match Hashtbl.find_opt store.controls attempt_id with
+      | None -> Error (missing Persistence.Attempt (Attempt_id.to_string attempt_id))
+      | Some request -> Hashtbl.replace store.controls attempt_id { request with completed_at = Some completed_at }; Ok ());
+    find_control = (fun id -> Ok (Hashtbl.find_opt store.controls id));
+    get_missing_since = (fun id -> Ok (Hashtbl.find_opt store.missing_since id));
+    set_missing_since = (fun id at -> if Hashtbl.mem attempts id then
+      (Hashtbl.replace store.missing_since id at; Ok ())
+      else Error (missing Persistence.Attempt (Attempt_id.to_string id)));
+    clear_missing_since = (fun id -> Hashtbl.remove store.missing_since id; Ok ());
+    create_stop_unknown = (fun ~worker_id ~attempt_id ~requested_at ->
+      let key = Worker_id.to_string worker_id ^ Attempt_id.to_string attempt_id in
+      if Hashtbl.mem store.stop_requests key then Ok false else
+        (Hashtbl.add store.stop_requests key { Persistence.attempt_id; worker_id;
+          kind = Persistence.Stop_unknown; requested_at; delivered_at = None; completed_at = None }; Ok true));
+    confirm_stop_unknown = (fun ~worker_id ~attempt_id ~completed_at ->
+      let key = Worker_id.to_string worker_id ^ Attempt_id.to_string attempt_id in
+      match Hashtbl.find_opt store.stop_requests key with
+      | None -> Error (Persistence.Conflict "stop control does not belong to worker")
+      | Some request -> Hashtbl.replace store.stop_requests key
+          { request with delivered_at = Some (Option.value ~default:completed_at request.delivered_at);
+            completed_at = Some completed_at }; Ok ());
+  } in
   { Persistence.jobs = job_repository; attempts = attempt_repository;
-    workers = worker_repository; events = event_repository }
+    workers = worker_repository; events = event_repository; controls }
 
 let create () =
   let store = Store.create () in

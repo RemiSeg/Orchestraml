@@ -100,7 +100,8 @@ let terminal_attempts_never_transition =
     let number = Scalar.Attempt_number.create 1 |> get_ok in
     let assigned = Attempt.create ~id:attempt_id ~job_id:(jid 99) ~number ~worker_id:(wid 99)
       ~assigned_at:timestamp in
-    let running, _ = Attempt.start ~now:timestamp assigned |> Result.get_ok in
+    let acknowledged = Attempt.acknowledge ~now:timestamp assigned |> Result.get_ok in
+    let running, _ = Attempt.start ~now:timestamp acknowledged |> Result.get_ok in
     let terminal = if succeed then
         fst (Attempt.succeed ~now:timestamp ~exit_code:0 running |> Result.get_ok)
       else fst (Attempt.time_out ~now:timestamp running |> Result.get_ok) in

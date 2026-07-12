@@ -28,6 +28,7 @@ type fixture = {
   scheduling : Services.Scheduling_service.t;
   execution : Services.Execution_service.t;
   retries : Services.Retry_service.t;
+  maintenance : Services.Maintenance_service.t;
 }
 
 let fixture () =
@@ -40,7 +41,12 @@ let fixture () =
     workers = Services.Worker_service.create ~persistence ~clock:clock_port ~ids;
     scheduling = Services.Scheduling_service.create ~persistence ~clock:clock_port ~ids ~health_policy;
     execution = Services.Execution_service.create ~persistence ~clock:clock_port;
-    retries = Services.Retry_service.create ~persistence ~clock:clock_port }
+    retries = Services.Retry_service.create ~persistence ~clock:clock_port;
+    maintenance = Services.Maintenance_service.create ~max_reconciliation_passes:1000
+      ~persistence ~clock:clock_port ~health_policy
+      ~acknowledgement_timeout:(positive Scalar.Timeout_seconds.create 30)
+      ~execution_report_grace:(positive Scalar.Timeout_seconds.create 10)
+      ~recovery_grace:(positive Scalar.Timeout_seconds.create 20) ~batch_size:100 }
 
 let submission : Services.Job_service.submission = {
   name = Scalar.Job_name.create "vertical job" |> get_ok;
@@ -99,7 +105,9 @@ let test_retry_then_success () =
   let events_before = Services.Job_service.events fixture.jobs (Job.id submitted) |> get_ok |> List.length in
   (match Services.Execution_service.report_failure fixture.execution (Attempt.id first_result.attempt)
       ~failure:(Failure.create Failure.Temporary_execution_failure) with
-   | Error _ -> () | Ok _ -> Alcotest.fail "duplicate terminal report accepted");
+   | Ok replayed -> Alcotest.(check string) "duplicate terminal report replayed" "failed"
+       (Attempt.status replayed.attempt |> Attempt_status.to_string)
+   | Error _ -> Alcotest.fail "identical duplicate terminal report was rejected");
   Alcotest.(check int) "duplicate report changed no events" events_before
     (Services.Job_service.events fixture.jobs (Job.id submitted) |> get_ok |> List.length);
   Support.Controlled_clock.advance fixture.clock ~seconds:5 |> get_ok;
@@ -195,6 +203,116 @@ let test_idempotent_submission () =
    | Error Services.Job_service.Idempotency_conflict -> ()
    | _ -> Alcotest.fail "idempotency conflict not detected")
 
+let test_targeted_poll_and_duplicate_result () =
+  let fixture = fixture () in
+  let worker = Services.Worker_service.register fixture.workers registration |> get_ok in
+  ignore (Services.Job_service.submit fixture.jobs submission |> get_ok);
+  let assignment = Services.Scheduling_service.poll_for_worker fixture.scheduling (Worker.id worker)
+    |> get_ok |> assigned in
+  ignore (Services.Execution_service.acknowledge_attempt fixture.execution (Attempt.id assignment.attempt) |> get_ok);
+  ignore (Services.Execution_service.start_attempt fixture.execution (Attempt.id assignment.attempt) |> get_ok);
+  let completed = Services.Execution_service.report_success fixture.execution
+    (Attempt.id assignment.attempt) ~exit_code:0 |> get_ok in
+  let replayed = Services.Execution_service.report_success fixture.execution
+    (Attempt.id assignment.attempt) ~exit_code:0 |> get_ok in
+  Alcotest.(check string) "duplicate result replays" "succeeded"
+    (Attempt.status replayed.attempt |> Attempt_status.to_string);
+  Alcotest.(check int) "capacity released once" 0 (Worker.active_jobs replayed.worker);
+  (match Services.Execution_service.report_failure fixture.execution
+      (Attempt.id assignment.attempt) ~failure:(Failure.create Failure.Invalid_command) with
+   | Error (Services.Execution_service.Invalid_operation _) -> ()
+   | _ -> Alcotest.fail "conflicting terminal result was accepted");
+  Alcotest.(check string) "job remains completed" "completed"
+    (Job.status completed.job |> Job_status.to_string)
+
+let test_heartbeat_validation () =
+  let fixture = fixture () in
+  let worker = Services.Worker_service.register fixture.workers registration |> get_ok in
+  let id = Attempt_id.of_string "00000000-0000-4000-8000-000000000099" |> get_ok in
+  (match Services.Worker_service.heartbeat fixture.workers (Worker.id worker)
+      { available_slots = 3; active_attempt_ids = [] } with
+   | Error (Services.Worker_service.Invalid_worker _) -> ()
+   | _ -> Alcotest.fail "heartbeat exceeding concurrency was accepted");
+  (match Services.Worker_service.heartbeat fixture.workers (Worker.id worker)
+      { available_slots = 1; active_attempt_ids = [id; id] } with
+   | Error (Services.Worker_service.Invalid_worker _) -> ()
+   | _ -> Alcotest.fail "duplicate heartbeat attempt IDs were accepted")
+
+let test_assignment_timeout_recovery () =
+  let fixture = fixture () in
+  ignore (Services.Job_service.submit fixture.jobs submission |> get_ok);
+  ignore (Services.Worker_service.register fixture.workers registration |> get_ok);
+  let assignment = Services.Scheduling_service.run_once fixture.scheduling |> get_ok |> assigned in
+  Support.Controlled_clock.advance fixture.clock ~seconds:31 |> get_ok;
+  Alcotest.(check int) "one recovered" 1
+    (Services.Maintenance_service.run_assignment_timeout_cycle fixture.maintenance |> get_ok);
+  let attempts = Services.Job_service.attempts fixture.jobs (Job.id assignment.job) |> get_ok in
+  Alcotest.(check string) "attempt lost" "lost"
+    (Attempt.status (List.hd attempts) |> Attempt_status.to_string);
+  let worker = Services.Worker_service.find fixture.workers (Worker.id assignment.worker)
+    |> get_ok |> Option.get in
+  Alcotest.(check int) "capacity released" 0 (Worker.active_jobs worker)
+
+let test_deadline_and_running_cancellation_controls () =
+  let fixture = fixture () in
+  let worker = Services.Worker_service.register fixture.workers registration |> get_ok in
+  ignore (Services.Job_service.submit fixture.jobs submission |> get_ok);
+  let assignment = Services.Scheduling_service.run_once fixture.scheduling |> get_ok |> assigned in
+  ignore (Services.Execution_service.acknowledge_attempt fixture.execution (Attempt.id assignment.attempt) |> get_ok);
+  ignore (Services.Execution_service.start_attempt fixture.execution (Attempt.id assignment.attempt) |> get_ok);
+  Support.Controlled_clock.advance fixture.clock ~seconds:41 |> get_ok;
+  Alcotest.(check int) "timeout control created" 1
+    (Services.Maintenance_service.run_execution_deadline_cycle fixture.maintenance |> get_ok);
+  let controls = Services.Worker_service.poll_controls fixture.workers (Worker.id worker) ~limit:10 |> get_ok in
+  Alcotest.(check int) "control delivered" 1 (List.length controls);
+  ignore (Services.Job_service.cancel fixture.jobs (Job.id assignment.job) |> get_ok);
+  let job = Services.Job_service.find fixture.jobs (Job.id assignment.job) |> get_ok |> Option.get in
+  Alcotest.(check string) "cancelling" "cancelling" (Job.status job |> Job_status.to_string)
+
+let test_unknown_process_control () =
+  let fixture = fixture () in
+  let worker = Services.Worker_service.register fixture.workers registration |> get_ok in
+  let unknown = Attempt_id.of_string "00000000-0000-4000-8000-000000000099" |> get_ok in
+  ignore (Services.Worker_service.heartbeat fixture.workers (Worker.id worker)
+    { available_slots = 1; active_attempt_ids = [unknown] } |> get_ok);
+  Alcotest.(check int) "stop created" 1
+    (Services.Maintenance_service.run_heartbeat_reconciliation_cycle fixture.maintenance |> get_ok);
+  let controls = Services.Worker_service.poll_controls fixture.workers (Worker.id worker) ~limit:10 |> get_ok in
+  (match controls with
+   | [{ Ports.Persistence.kind = Ports.Persistence.Stop_unknown; _ }] -> ()
+   | _ -> Alcotest.fail "expected one stop-unknown control");
+  ignore (Services.Worker_service.confirm_stop_unknown fixture.workers (Worker.id worker) unknown |> get_ok);
+  Alcotest.(check int) "completed control hidden" 0
+    (Services.Worker_service.poll_controls fixture.workers (Worker.id worker) ~limit:10 |> get_ok |> List.length)
+
+let maintenance fixture ~batch ~passes = Services.Maintenance_service.create
+  ~max_reconciliation_passes:passes ~persistence:fixture.persistence
+  ~clock:(Support.Controlled_clock.port fixture.clock) ~health_policy
+  ~acknowledgement_timeout:(positive Scalar.Timeout_seconds.create 30)
+  ~execution_report_grace:(positive Scalar.Timeout_seconds.create 10)
+  ~recovery_grace:(positive Scalar.Timeout_seconds.create 20) ~batch_size:batch
+
+let test_reconciliation_batches_and_limit () =
+  let fixture = fixture () in
+  let large_registration = { registration with
+    max_concurrency = positive Scalar.Concurrency.create 4 } in
+  ignore (Services.Worker_service.register fixture.workers large_registration |> get_ok);
+  for _ = 1 to 3 do
+    ignore (Services.Job_service.submit fixture.jobs submission |> get_ok);
+    ignore (Services.Scheduling_service.run_once fixture.scheduling |> get_ok |> assigned)
+  done;
+  Support.Controlled_clock.advance fixture.clock ~seconds:31 |> get_ok;
+  let summary = Services.Maintenance_service.reconcile_startup
+    (maintenance fixture ~batch:1 ~passes:10) |> get_ok in
+  Alcotest.(check int) "all batches drained" 3 summary.assignments_recovered;
+  let unknown = Attempt_id.of_string "00000000-0000-4000-8000-000000000088" |> get_ok in
+  let worker = Services.Worker_service.list fixture.workers |> get_ok |> List.hd in
+  ignore (Services.Worker_service.heartbeat fixture.workers (Worker.id worker)
+    { available_slots = 4; active_attempt_ids = [unknown] } |> get_ok);
+  match Services.Maintenance_service.reconcile_startup (maintenance fixture ~batch:1 ~passes:1) with
+  | Error Services.Maintenance_service.Reconciliation_did_not_converge -> ()
+  | _ -> Alcotest.fail "reconciliation pass limit was not enforced"
+
 let () = Alcotest.run "orchestraml-application" [
   "memory", [
     Alcotest.test_case "transaction rollback" `Quick test_transaction_rollback;
@@ -208,5 +326,11 @@ let () = Alcotest.run "orchestraml-application" [
     Alcotest.test_case "timeout retry policy" `Quick test_timeout_uses_retry_policy;
     Alcotest.test_case "maximum attempts" `Quick test_maximum_attempts;
     Alcotest.test_case "idempotent submission" `Quick test_idempotent_submission;
+    Alcotest.test_case "targeted poll and duplicate result" `Quick test_targeted_poll_and_duplicate_result;
+    Alcotest.test_case "heartbeat validation" `Quick test_heartbeat_validation;
+    Alcotest.test_case "assignment timeout recovery" `Quick test_assignment_timeout_recovery;
+    Alcotest.test_case "deadline and cancellation controls" `Quick test_deadline_and_running_cancellation_controls;
+    Alcotest.test_case "unknown process control" `Quick test_unknown_process_control;
+    Alcotest.test_case "reconciliation batches and limit" `Quick test_reconciliation_batches_and_limit;
   ];
 ]

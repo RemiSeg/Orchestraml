@@ -20,6 +20,7 @@
   cmdliner
   uri
   base64
+  cstruct
   (alcotest :with-test)
   (qcheck :with-test)
   (qcheck-alcotest :with-test)))

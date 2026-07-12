@@ -63,9 +63,71 @@ let run () =
     ["created"; "replayed"] classifications;
   let persistence_b = Infrastructure.Postgres.Persistence.create database in
   let jobs_b = Services.Job_service.create ~persistence:persistence_b ~clock ~ids in
-  match Services.Job_service.find jobs_b (Job.id created) |> service_ok with
+  (match Services.Job_service.find jobs_b (Job.id created) |> service_ok with
   | None -> Alcotest.fail "job did not survive persistence recreation"
   | Some restored -> Alcotest.(check string) "restored job" "pending"
-      (Job.status restored |> Job_status.to_string)
+      (Job.status restored |> Job_status.to_string));
+  let worker_id = Orchestraml_domain.Identifiers.Worker_id.of_string
+    "00000000-0000-4000-8000-000000000777" |> get_ok in
+  let registration : Services.Worker_service.registration = {
+    name = "contract-worker"; labels = Foundation.Worker_label.Set.empty;
+    max_concurrency = Scalar.Concurrency.create 1 |> get_ok;
+    total_resources = Resources.create
+      ~cpu:(Scalar.Cpu_millicores.create 1000 |> get_ok)
+      ~memory:(Scalar.Memory_mib.create 512 |> get_ok) } in
+  let worker_service = Services.Worker_service.create ~persistence:persistence_b ~clock ~ids in
+  let register () = Services.Worker_service.register_with_id worker_service worker_id registration in
+  let left = ref None and right = ref None in
+  Eio.Fiber.both (fun () -> left := Some (register ())) (fun () -> right := Some (register ()));
+  let registration_kinds = [Option.get !left; Option.get !right] |> List.map (function
+    | Ok (Services.Worker_service.Registered _) -> "registered"
+    | Ok (Services.Worker_service.Updated _) -> "updated"
+    | Error _ -> "error") |> List.sort String.compare in
+  Alcotest.(check (list string)) "concurrent worker upsert"
+    ["registered"; "updated"] registration_kinds;
+  ignore (Services.Worker_service.heartbeat worker_service worker_id
+    { available_slots = 1; active_attempt_ids = [] } |> get_ok);
+  let heartbeat = persistence_b.with_transaction (fun repositories ->
+    repositories.workers.find_heartbeat worker_id) in
+  (match heartbeat with
+   | Ok (Ok (Some report)) -> Alcotest.(check int) "heartbeat slots" 1 report.available_slots
+   | _ -> Alcotest.fail "heartbeat observation was not persisted");
+  let unknown = Orchestraml_domain.Identifiers.Attempt_id.of_string
+    "00000000-0000-4000-8000-000000000778" |> get_ok in
+  let create_stop () = persistence_b.with_transaction (fun repositories ->
+    repositories.controls.create_stop_unknown ~worker_id ~attempt_id:unknown
+      ~requested_at:(clock.now ())) in
+  let left = ref None and right = ref None in
+  Eio.Fiber.both (fun () -> left := Some (create_stop ())) (fun () -> right := Some (create_stop ()););
+  let created = [Option.get !left; Option.get !right] |> List.map (function
+    | Ok (Ok true) -> "created" | Ok (Ok false) -> "existing" | _ -> "error")
+    |> List.sort String.compare in
+  Alcotest.(check (list string)) "one unknown stop request" ["created";"existing"] created;
+  let controls = Services.Worker_service.poll_controls worker_service worker_id ~limit:10 |> get_ok in
+  Alcotest.(check int) "stop control persisted" 1 (List.length controls);
+  let wrong_worker = Orchestraml_domain.Identifiers.Worker_id.of_string
+    "00000000-0000-4000-8000-000000000779" |> get_ok in
+  ignore (Services.Worker_service.register_with_id worker_service wrong_worker registration |> get_ok);
+  (match Services.Worker_service.confirm_stop_unknown worker_service wrong_worker unknown with
+   | Error (Services.Worker_service.Persistence_error (Ports.Persistence.Conflict _)) -> ()
+   | _ -> Alcotest.fail "wrong worker confirmed stop control");
+  ignore (Services.Worker_service.confirm_stop_unknown worker_service worker_id unknown |> get_ok);
+  ignore (Services.Worker_service.confirm_stop_unknown worker_service worker_id unknown |> get_ok);
+  let scheduled_submission = { submission with priority = Scalar.Priority.create 100 } in
+  let scheduled_job = Services.Job_service.submit jobs_b scheduled_submission |> service_ok in
+  let health_policy = Worker_health.create
+    ~suspect_after:(Scalar.Timeout_seconds.create 30 |> get_ok)
+    ~offline_after:(Scalar.Timeout_seconds.create 60 |> get_ok) |> get_ok in
+  let scheduling = Services.Scheduling_service.create ~persistence:persistence_b ~clock ~ids ~health_policy in
+  let poll () = Services.Scheduling_service.poll_for_worker scheduling worker_id in
+  let first_poll = ref None and second_poll = ref None in
+  Eio.Fiber.both (fun () -> first_poll := Some (poll ())) (fun () -> second_poll := Some (poll ()));
+  let poll_kinds = [Option.get !first_poll; Option.get !second_poll] |> List.map (function
+    | Ok (Services.Scheduling_service.Assigned _) -> "assigned"
+    | Ok Services.Scheduling_service.No_assignment -> "none"
+    | Error _ -> "error") |> List.sort String.compare in
+  Alcotest.(check (list string)) "concurrent targeted poll" ["assigned"; "none"] poll_kinds;
+  Alcotest.(check int) "one attempt" 1
+    (Services.Job_service.attempts jobs_b (Job.id scheduled_job) |> service_ok |> List.length)
 let () = Alcotest.run "orchestraml-postgres" ["restart",[
   Alcotest.test_case "persist and recreate coordinator dependencies" `Quick run]]

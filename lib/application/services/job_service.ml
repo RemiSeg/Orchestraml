@@ -58,17 +58,49 @@ let cancel service id =
     | Error error -> Error error
     | Ok None -> Error (Ports.Persistence.Not_found (Ports.Persistence.Job, Job_id.to_string id))
     | Ok (Some job) ->
-        if Job_status.equal (Job.status job) Job_status.Cancelled then Ok (`Cancelled job)
-        else if not (Job_status.equal (Job.status job) Job_status.Pending
-          || Job_status.equal (Job.status job) Job_status.Retry_waiting) then
-          Ok (`Invalid "only pending or retry-waiting jobs can be cancelled here")
-        else match Job.request_cancel ~now:(service.clock.now ()) job with
+        if Job_status.equal (Job.status job) Job_status.Cancelled
+          || Job_status.equal (Job.status job) Job_status.Cancelling then Ok (`Cancelled job)
+        else if Job_status.equal (Job.status job) Job_status.Pending
+          || Job_status.equal (Job.status job) Job_status.Retry_waiting then
+          (match Job.cancel_before_execution ~now:(service.clock.now ()) job with
           | Error error -> Ok (`Transition error)
           | Ok (cancelled, event) ->
               match repositories.jobs.update_job cancelled with
               | Error error -> Error error
               | Ok () -> match repositories.events.append_event event with
-                  | Error error -> Error error | Ok () -> Ok (`Cancelled cancelled)) with
+                  | Error error -> Error error | Ok () -> Ok (`Cancelled cancelled))
+        else if Job_status.equal (Job.status job) Job_status.Assigned
+          || Job_status.equal (Job.status job) Job_status.Running then
+          (match repositories.attempts.list_attempts_for_job id with
+           | Error error -> Error error | Ok [] -> Ok (`Invalid "active job has no attempt")
+           | Ok attempts ->
+               let attempt = List.hd (List.rev attempts) and now = service.clock.now () in
+               if Job_status.equal (Job.status job) Job_status.Assigned
+                 && Attempt.acknowledged_at attempt = None then
+                 (match Job.cancel_before_execution ~now job, Attempt.cancel ~now attempt,
+                        repositories.workers.find_worker (Attempt.worker_id attempt) with
+                  | Error error, _, _ | _, Error error, _ -> Ok (`Transition error)
+                  | _, _, Error error -> Error error | _, _, Ok None -> Ok (`Invalid "assigned worker is missing")
+                  | Ok (cancelled_job, job_event), Ok (cancelled_attempt, attempt_event), Ok (Some worker) ->
+                      (match Worker.release ~requirements:(Job.requirements job) worker with
+                       | Error _ -> Ok (`Invalid "worker reservation is inconsistent")
+                       | Ok worker ->
+                           (match repositories.jobs.update_job cancelled_job with Error e -> Error e | Ok () ->
+                            match repositories.attempts.update_attempt cancelled_attempt with Error e -> Error e | Ok () ->
+                            match repositories.workers.update_worker worker with Error e -> Error e | Ok () ->
+                            match repositories.events.append_event attempt_event with Error e -> Error e | Ok () ->
+                            match repositories.events.append_event job_event with Error e -> Error e | Ok () -> Ok (`Cancelled cancelled_job))))
+               else match Job.request_execution_cancel ~now job with
+                 | Error error -> Ok (`Transition error)
+                 | Ok (cancelling, event) ->
+                     let control : Ports.Persistence.control_request = {
+                       attempt_id = Attempt.id attempt; worker_id = Attempt.worker_id attempt;
+                       kind = Ports.Persistence.Cancel; requested_at = now;
+                       delivered_at = None; completed_at = None } in
+                     (match repositories.controls.create_control control with Error e -> Error e | Ok _ ->
+                      match repositories.jobs.update_job cancelling with Error e -> Error e | Ok () ->
+                      match repositories.events.append_event event with Error e -> Error e | Ok () -> Ok (`Cancelled cancelling)))
+        else Ok (`Invalid "job cannot be cancelled from its current state")) with
   | Error error | Ok (Error error) -> Error (Persistence_error error)
   | Ok (Ok (`Invalid reason)) -> Error (Invalid_operation reason)
   | Ok (Ok (`Transition error)) -> Error (Transition_rejected error)

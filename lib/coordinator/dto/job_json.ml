@@ -94,6 +94,7 @@ let attempt value = `Assoc [
   "attempt_number", `Int (Attempt.number value |> Scalar.Attempt_number.value);
   "status", `String (Attempt.status value |> Attempt_status.to_string);
   "assigned_at", `String (Attempt.assigned_at value |> Timestamp.to_rfc3339);
+  "acknowledged_at", (match Attempt.acknowledged_at value with None -> `Null | Some value -> `String (Timestamp.to_rfc3339 value));
   "started_at", (match Attempt.started_at value with None -> `Null | Some value -> `String (Timestamp.to_rfc3339 value));
   "finished_at", (match Attempt.finished_at value with None -> `Null | Some value -> `String (Timestamp.to_rfc3339 value))
 ]

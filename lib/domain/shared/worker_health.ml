@@ -13,5 +13,6 @@ let classify policy ~now ~last_heartbeat =
   | Some age when age >= Scalar.Timeout_seconds.value policy.offline_after -> Offline
   | Some age when age >= Scalar.Timeout_seconds.value policy.suspect_after -> Suspect
   | Some _ -> Healthy
+let offline_after policy = policy.offline_after
 let equal left right = left = right
 let to_string = function Healthy -> "healthy" | Suspect -> "suspect" | Offline -> "offline"

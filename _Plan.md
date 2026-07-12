@@ -839,7 +839,238 @@ Testing and acceptance
 
 Phase 3 is complete when accepted jobs and their history survive coordinator restart, HTTP contracts are stable and tested, and PostgreSQL preserves every application invariant without adding worker execution or recovery behavior from later phases.
 
-11. Suggested implementation order
+11. Phase 4 real worker agent
+
+Purpose
+
+Phase 4 introduces a separate `orchestraml-worker` process and the worker-facing coordinator protocol. A worker registers its stable identity and capacity, sends heartbeats, polls for work, acknowledges an assignment, executes a real local command, and reports the outcome. The coordinator remains the only authority for scheduling decisions, durable lifecycle state, retry decisions, and capacity reservations.
+
+Worker structure
+
+Create one wrapped worker library with qualified subdirectories:
+
+```text
+lib/worker/
+├── agent/       polling, heartbeat, slot control, and execution coordination
+├── client/      coordinator HTTP client and explicit JSON contracts
+├── executor/    executor interface and local-process implementation
+└── runtime/     validated configuration and stable worker identity storage
+
+bin/worker/
+└── main.ml      production composition and process lifecycle
+```
+
+Use one root Dune file for the wrapped library and one concise engineering document for the library and each category. Do not introduce a dependency-injection framework, generic message bus, or separate library for every folder.
+
+Identity and registration
+
+The worker owns a stable `Worker_id` stored in a configurable local identity file. The first startup creates and persists the identifier atomically; later startups reuse it. Registration is an idempotent upsert keyed by worker ID, so restarting the same worker updates its name, labels, total resources, concurrency, and heartbeat without creating a second logical worker.
+
+Registration supplies the worker ID, worker name, normalized labels, maximum concurrency, total CPU millicores, and total memory MiB. Phase 4 trusts worker registration and adds no authentication or enrollment tokens.
+
+Worker HTTP protocol
+
+Add explicit DTOs and routes:
+
+```text
+PUT  /v1/workers/{worker_id}/registration
+POST /v1/workers/{worker_id}/heartbeat
+POST /v1/workers/{worker_id}/assignments/poll
+POST /v1/attempts/{attempt_id}/acknowledge
+POST /v1/attempts/{attempt_id}/started
+POST /v1/attempts/{attempt_id}/result
+GET  /v1/workers
+GET  /v1/workers/{worker_id}
+```
+
+All requests and responses use versioned explicit JSON contracts, string UUIDs, RFC 3339 UTC timestamps, and unit-bearing resource names. Invalid identifiers or payloads return `400`, missing workers or attempts return `404`, stale or incompatible lifecycle reports return `409`, and unexpected persistence errors return `500` without exposing internal exceptions or SQL.
+
+Phase 4 polling is a normal request repeated at a validated configurable interval. An empty poll returns `204 No Content`. Long polling, server push, and autonomous coordinator scheduling loops are deferred.
+
+Targeted assignment
+
+Extend the scheduling application service with a targeted operation for one polling worker. In one PostgreSQL transaction it locks the worker and the next eligible pending job, rechecks health, labels, slots, CPU, and memory, reserves worker capacity, transitions the job to `Assigned`, creates the assigned attempt, persists both entities and the worker, appends transition events, and returns the assignment.
+
+The operation returns `No_assignment` when the polling worker has no compatible work. Concurrent polls for the same worker or job must not exceed capacity or create multiple active attempts. The worker never selects jobs or modifies scheduling priority.
+
+Acknowledgement and start
+
+Polling creates an `Assigned` attempt. The worker acknowledges only after it has accepted responsibility and acquired a local execution slot. Acknowledgement is persisted and idempotent but does not mark the attempt running. After the child process is successfully created, the worker reports `started`; the existing execution service then atomically moves the attempt and job to `Running`.
+
+Persist an acknowledgement timestamp separately from attempt status so acknowledgement timeout can be implemented in Phase 5 without placing identifiers or protocol details inside statuses. Duplicate acknowledgement and start reports return the already-established state. Conflicting or stale reports return a typed invalid-operation result without modifying storage.
+
+Heartbeats and capacity
+
+Registration defines total capacity and coordinator reservations remain authoritative for scheduling. Heartbeats update the worker's last-seen timestamp and report worker availability, locally active attempt IDs, and available local slots for observation. They must not overwrite reserved CPU, reserved memory, or active-job counts from worker-provided values.
+
+Phase 4 stores heartbeats but does not classify stale workers, mark attempts lost, reconcile disagreement, or release capacity after missed heartbeats. Those recovery rules belong to Phase 5.
+
+Local process executor
+
+Define a narrow executor interface accepting a validated command execution specification and returning success or a structured process-start/execution failure. The production local executor uses Eio process APIs and structured concurrency.
+
+Execute the executable and argument vector directly. Never build a shell command string or invoke PowerShell, `cmd.exe`, `/bin/sh`, or another shell implicitly. Phase 4 supports only local command specifications; container specifications produce a typed unsupported-execution failure until Phase 6.
+
+The executor must acquire one local concurrency slot, start and reap the child process, concurrently drain stdout and stderr so pipes cannot deadlock, and release the slot on every outcome. Output is retained only in a small bounded diagnostic tail or discarded after draining; durable and streamed logs begin in Phase 6. Exit code zero reports success, non-zero exit reports a structured temporary execution failure, and missing executable, invalid command, or permission errors use their existing non-retryable failure categories.
+
+Execution timeout and running cancellation are intentionally deferred to Phase 5. The worker must still shut down cleanly: it stops polling and heartbeats, waits for its structured child fibers, and does not leave unmanaged background fibers.
+
+Result reporting
+
+Use one tagged result payload for `succeeded`, `failed`, `timed_out`, `lost`, and `cancelled`, although the Phase 4 local executor normally emits only success or failure. The coordinator maps reports through `Execution_service`; the HTTP layer never performs domain transitions directly.
+
+Terminal reports atomically update the attempt and job, apply retry policy where appropriate, release worker capacity, and append events. Duplicate terminal reports are idempotent when they describe the stored outcome. A different outcome for an already-terminal attempt returns `409` and preserves existing state.
+
+Worker runtime configuration
+
+Validate environment configuration before starting fibers:
+
+```text
+COORDINATOR_URL                 required
+WORKER_ID_FILE                  default /var/lib/orchestraml/worker-id
+WORKER_NAME                     required
+WORKER_LABELS                   default empty comma-separated list
+WORKER_MAX_CONCURRENCY          required and positive
+WORKER_CPU_MILLICORES           required and non-negative
+WORKER_MEMORY_MIB               required and non-negative
+HEARTBEAT_INTERVAL_SECONDS      default 10 and positive
+POLL_INTERVAL_SECONDS           default 2 and positive
+```
+
+The worker HTTP client uses bounded connection, request, and response-body limits. Temporary coordinator unavailability causes bounded retry with a fixed Phase 4 delay; exponential connection backoff and failure recovery may be refined in Phase 5. Protocol errors are surfaced and do not cause the worker to execute an unvalidated assignment.
+
+Testing and acceptance
+
+* Domain and application tests cover acknowledgement consistency and targeted scheduling without HTTP or real processes.
+* Repository contract tests cover registration upsert, heartbeat persistence, acknowledgement timestamps, and missing-entity updates against memory and PostgreSQL.
+* Concurrency tests prove that simultaneous polls cannot assign one job twice or exceed a worker's concurrency and resource capacity.
+* DTO and HTTP tests cover every worker endpoint, empty polls, malformed payloads, missing entities, duplicate reports, and conflicts.
+* Executor tests cover argument preservation without a shell, success, non-zero exit, missing executable, permission failure, stdout/stderr draining, and slot release after failures.
+* Worker-agent tests use a controlled coordinator client and executor to verify registration, heartbeat, polling, acknowledgement, start, result reporting, and graceful shutdown deterministically.
+* The end-to-end integration test starts PostgreSQL, coordinator, and worker as separate processes, submits a harmless local command, and verifies a completed job, succeeded attempt, ordered events, and fully released worker capacity through the HTTP API.
+* All Phase 1–3 tests remain green.
+
+Phase 4 is complete when separate coordinator and worker processes execute a real local command end to end and persist the complete successful lifecycle without adding Phase 5 recovery or Phase 6 container/logging behavior.
+
+Explicit boundaries
+
+Phase 4 adds no worker authentication, long polling, autonomous retry loop, stale-worker classification, lost-attempt recovery, assignment acknowledgement timeout, execution timeout, running cancellation, startup reconciliation, Docker execution, durable log ingestion, live log following, CLI, or multi-coordinator behavior.
+
+12. Phase 5 reliability and recovery
+
+Purpose
+
+Phase 5 makes the coordinator-worker system self-maintaining after ordinary process and network failures. It adds autonomous maintenance cycles, durable cancellation, assignment and execution deadlines, worker-loss recovery, and startup reconciliation. PostgreSQL remains the authority for lifecycle state and capacity; worker observations are evidence used by explicit recovery rules, never a replacement for coordinator state.
+
+Reliability model
+
+Execution is at least once. A coordinator must never record success without a worker success report. When it cannot prove that an assigned or running process has stopped, it records the attempt as lost only after the applicable timeout and recovery rules, then applies the existing retry policy. Jobs therefore must be safe to retry or provide their own external idempotency.
+
+Every maintenance operation is transactional, idempotent, bounded by a batch size, and safe to repeat after coordinator restart. PostgreSQL row locks and `FOR UPDATE SKIP LOCKED` prevent duplicate recovery work. Phase 5 targets one active coordinator process; multi-coordinator leadership and leases remain out of scope.
+
+Coordinator maintenance runtime
+
+Run the following supervised Eio loops under the coordinator switch:
+
+* Scheduling loop assigns pending jobs to healthy workers with available durable capacity.
+* Retry loop releases due `Retry_waiting` jobs back to `Pending`.
+* Assignment-timeout loop recovers assignments that were not acknowledged in time.
+* Deadline loop requests termination of executions that exceed their configured timeout.
+* Worker-recovery loop classifies stale workers and recovers their active attempts.
+* Cancellation-delivery loop makes durable control requests available to workers.
+
+Each loop receives the clock port and a validated interval. A failed cycle is logged and retried without terminating the HTTP server or sibling loops. Migration mismatch, invalid configuration, and failed startup reconciliation remain fatal startup errors.
+
+Keep orchestration in focused application services. Extend the existing scheduling and retry services where their responsibility already fits; add one maintenance/recovery service for timeout, stale-worker, and reconciliation cycles. Do not create one service per SQL query or a generic background-job framework.
+
+Worker health and failure detection
+
+Derive `Healthy`, `Suspect`, and `Offline` from the last persisted heartbeat and configured thresholds. The suspect threshold must be positive and lower than the offline threshold.
+
+* Healthy workers remain eligible for new assignments.
+* Suspect workers receive no new assignments, but their active attempts are not changed.
+* Offline workers receive no assignments. Each active assigned or running attempt is atomically marked `Lost`, its worker capacity is released exactly once, and its job is retried or permanently failed through the existing retry policy.
+
+A later heartbeat may return an offline worker to healthy status, but it cannot revive a terminal attempt or reclaim released reservations. A worker-reported active attempt that the coordinator does not recognize is never adopted; the coordinator returns a stop instruction for that process.
+
+Assignment acknowledgement timeout
+
+An `Assigned` attempt whose `acknowledged_at` remains empty beyond the validated acknowledgement timeout is treated as an assignment-timeout failure. In one transaction the coordinator terminates the attempt, releases worker capacity, records transition events, and either schedules retry or permanently fails the job.
+
+Acknowledged assignments are not recovered by this rule. If acknowledgement and timeout recovery race, row locking allows exactly one transition and one capacity release. A late acknowledgement receives the stored terminal state as a conflict and must not execute the assignment.
+
+Execution timeout
+
+The worker is the primary execution-timeout enforcer because it owns the child process. Extend the staged executor handle with graceful termination and forced termination. When the job timeout expires, the worker sends the platform termination signal, waits for a configurable grace period, force-kills if necessary, continuously drains output, reaps the child, and reports `timed_out`.
+
+The coordinator independently persists an execution deadline when the attempt starts. If no terminal report arrives by the deadline plus a report-grace interval, it creates a durable timeout-control request. It does not immediately release capacity while the worker is still healthy because the process may still be running. If the worker becomes offline, worker-loss recovery marks the attempt lost. A worker response of `timed_out` follows the configured timeout retry policy.
+
+Durable cancellation protocol
+
+Extend cancellation to every non-terminal job state:
+
+* `Pending` and `Retry_waiting` jobs are cancelled immediately as today.
+* An unacknowledged assigned attempt may be cancelled transactionally without worker execution, terminating the attempt and releasing capacity.
+* An acknowledged assigned or running attempt moves the job to `Cancelling` and creates one durable cancellation control request.
+* Repeated cancellation requests return the existing cancelled or cancelling state without creating duplicate controls.
+
+Add a worker control-poll endpoint separate from assignment polling. It returns cancellation or timeout-termination instructions only for attempts owned by that worker. Delivery is recorded but remains repeatable until a terminal report is accepted, so a lost HTTP response cannot lose the instruction.
+
+On cancellation, the worker stops the child with the same graceful-then-forced sequence and reports `cancelled`. The coordinator atomically terminates the attempt, transitions the job to `Cancelled`, releases capacity, completes the control request, and records events. Cancellation wins only if committed before another terminal outcome; otherwise the already-recorded terminal outcome remains authoritative.
+
+Persistence and migrations
+
+Add immutable migrations for:
+
+* Execution deadlines and any recovery timestamps required to query expired attempts efficiently.
+* Durable attempt control requests with attempt ID, worker ID, kind, request time, delivery time, completion time, and uniqueness preventing duplicate active controls.
+* Supporting indexes for bounded acknowledgement-timeout, execution-deadline, worker-health, retry-ready, and control-poll queries.
+
+Do not persist derived worker health as an independent source of truth. Query and derive it from `last_seen_at` and the supplied clock. Database constraints must preserve one active attempt per job, one capacity release, valid control-request chronology, and references to historical attempts and workers.
+
+Extend both memory and PostgreSQL persistence with the same locking and query semantics. Repository methods return immutable values and typed corruption or conflict errors; recovery code must not inspect adapter-owned tables directly.
+
+Startup reconciliation and restart behavior
+
+Before starting HTTP traffic and maintenance loops, run an idempotent bounded reconciliation until no immediately actionable records remain:
+
+* Release retry-waiting jobs whose retry time has arrived.
+* Recover expired unacknowledged assignments.
+* Recover active attempts owned by workers already beyond the offline threshold.
+* Resume incomplete cancellation and timeout-control requests.
+* Verify that active job, attempt, and worker reservation relationships agree.
+
+Reconciliation repairs only states covered by explicit domain/application transitions. Impossible persisted combinations are reported as typed storage-corruption errors and prevent startup rather than being guessed into a new state. Healthy running attempts survive coordinator restart unchanged.
+
+Worker restart and heartbeat reconciliation
+
+The worker continues to reuse its stable identity. Heartbeats report unique locally active attempt IDs and available slots. After a configurable recovery grace period, an active coordinator attempt missing from repeated heartbeats is treated as lost only through the same transactional recovery path. Temporary heartbeat disagreement is observable but does not immediately release capacity.
+
+The worker must retain active in-process execution handles until results are accepted. Phase 5 does not persist child-process handles across worker death; after worker restart, prior local processes cannot be reattached and are handled through offline/missing-attempt recovery.
+
+Configuration
+
+Add validated coordinator settings for scheduler interval, retry interval, maintenance interval, suspect threshold, offline threshold, assignment acknowledgement timeout, execution report grace, recovery grace, and maintenance batch size. Add worker settings for control-poll interval and termination grace. Defaults must be documented in runtime configuration and tests must inject short controlled values rather than waiting in real time.
+
+Testing and acceptance
+
+* Domain tests cover cancellation transitions, acknowledgement chronology, timeout failure classification, terminal immutability, and exactly-once capacity release.
+* Controlled-clock application tests cover every maintenance cycle without sleeping, including repeated and concurrent cycles.
+* Memory and PostgreSQL repository-contract tests cover deadline queries, control delivery, recovery locking, rollback, and restart persistence.
+* Worker tests cover graceful termination, forced termination, timeout reporting, cancellation, output draining, child reaping, slot release, and repeated control delivery.
+* HTTP tests cover control polling, running cancellation, idempotent cancellation, stale reports, invalid ownership, and timeout results.
+* Fault-injection integration tests stop a worker before acknowledgement, while running, and while reporting a result; each case must end in one valid durable outcome with no leaked capacity.
+* Coordinator restart tests prove that healthy running attempts remain active, due maintenance resumes, durable controls are redelivered, and no transition or event is duplicated.
+* A retry-after-worker-loss scenario must assign a replacement attempt and complete successfully while retaining ordered history for the lost attempt.
+* All Phase 1–4 tests remain green.
+
+Phase 5 is complete when autonomous scheduling and retry operate, pending and running jobs can be cancelled, execution deadlines are enforced, worker crashes and coordinator restarts converge to valid durable states, and every recovery path preserves attempt history and worker capacity.
+
+Explicit boundaries
+
+Phase 5 adds no Docker execution, durable or live logs, authentication, TLS, distributed coordinator leadership, cross-worker process adoption, exactly-once execution guarantee, workflow dependencies, cron scheduling, web UI, or general CLI. Those concerns remain in later phases or outside the current roadmap.
+
+13. Suggested implementation order
 
 The project should be built vertically, not by creating every empty module first.
 
@@ -872,20 +1103,24 @@ PostgreSQL atomic-assignment and concurrent-submission tests
 Coordinator process configuration and restart integration test
 Complete when accepted jobs and their history survive coordinator restart and remain queryable through the tested HTTP API.
 Phase 4: Real worker agent
-Registration
-Heartbeats
-HTTP assignment polling and acknowledgement
-Local process execution
-Completion reporting
+Stable worker identity and idempotent registration
+Heartbeat persistence without reservation reconciliation
+Targeted transactional assignment for the polling worker
+HTTP polling, acknowledgement, start, and result contracts
+Eio worker agent with bounded polling and heartbeat fibers
+Direct local process execution without a shell
+Duplicate-report, concurrency, and real-process tests
+Separate coordinator/worker end-to-end integration scenario
 Complete when separate coordinator and worker processes execute a real local command end to end.
 Phase 5: Reliability
-Retry waiting
-Worker failure detection
-Timeouts
-Cancellation
-Coordinator recovery
-Assignment acknowledgement timeout
-Complete when worker crashes and coordinator restarts produce valid, durable states.
+Autonomous scheduling, retry, and bounded maintenance loops
+Suspect/offline worker classification and lost-attempt recovery
+Assignment acknowledgement timeout with exactly-once capacity release
+Worker-enforced execution timeout and coordinator deadline controls
+Durable pending, assigned, and running cancellation
+Startup reconciliation and heartbeat disagreement handling
+Controlled-clock, concurrency, fault-injection, and restart tests
+Complete when worker crashes, execution deadlines, cancellation, and coordinator restarts converge to valid durable states without duplicate transitions or leaked capacity.
 Phase 6: Container execution and logs
 Docker executor
 Incremental log upload

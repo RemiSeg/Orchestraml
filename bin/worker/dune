@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name orchestraml-worker)
+ (libraries orchestraml.worker eio_main eio cohttp-eio cmdliner))

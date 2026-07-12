@@ -1,0 +1,3 @@
+(executable
+ (name stubborn_process)
+ (libraries unix))

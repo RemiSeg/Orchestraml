@@ -47,3 +47,55 @@ let run_once service =
   | Ok (Ok (`Capacity error)) -> Error (Capacity_rejected error)
   | Ok (Ok (`Transition error)) -> Error (Transition_rejected error)
   | Ok (Ok `Attempt_number) -> Error Invalid_attempt_number
+let poll_for_worker service worker_id =
+  let result = service.persistence.with_transaction (fun repositories ->
+    match repositories.workers.lock_worker worker_id with
+    | Error error -> Error error
+    | Ok None -> Error (Ports.Persistence.Not_found (Ports.Persistence.Worker,
+        Identifiers.Worker_id.to_string worker_id))
+    | Ok (Some worker) -> match repositories.attempts.claim_assigned_attempt worker_id ~polled_at:(service.clock.now ()) with
+        | Error error -> Error error
+        | Ok claimed ->
+            (match claimed with
+             | Some attempt -> (match repositories.jobs.find_job (Attempt.job_id attempt) with
+                 | Error error -> Error error
+                 | Ok None -> Error (Ports.Persistence.Not_found (Ports.Persistence.Job,
+                     Identifiers.Job_id.to_string (Attempt.job_id attempt)))
+                 | Ok (Some job) -> Ok (`Outcome (Assigned { job; attempt; worker })))
+             | None -> match repositories.jobs.list_pending_jobs () with
+        | Error error -> Error error
+        | Ok jobs ->
+            let now = service.clock.now () in
+            let eligible = List.filter (fun job ->
+              Eligibility.evaluate ~health_policy:service.health_policy ~now ~job ~worker
+              |> Eligibility.is_eligible) jobs in
+            match Scheduler_policy.select_job eligible with
+            | None -> Ok (`Outcome No_assignment)
+            | Some job -> match Worker.reserve ~requirements:(Job.requirements job) worker with
+                | Error error -> Ok (`Capacity error)
+                | Ok reserved_worker -> match Job.assign ~now job with
+                    | Error error -> Ok (`Transition error)
+                    | Ok (assigned_job, event) ->
+                        match Scalar.Attempt_number.create (Job.attempts_started assigned_job) with
+                        | Error _ -> Ok `Attempt_number
+                        | Ok number ->
+                            let attempt = Attempt.create ~id:(service.ids.next_attempt_id ())
+                              ~job_id:(Job.id assigned_job) ~number ~worker_id ~assigned_at:now in
+                            match repositories.jobs.update_job assigned_job with
+                            | Error error -> Error error
+                            | Ok () -> match repositories.attempts.create_attempt attempt with
+                                | Error error -> Error error
+                                | Ok () -> match repositories.workers.update_worker reserved_worker with
+                                    | Error error -> Error error
+                                    | Ok () -> match repositories.events.append_event event with
+                                        | Error error -> Error error
+                                        | Ok () -> match repositories.attempts.claim_assigned_attempt worker_id ~polled_at:now with
+                                            | Error error -> Error error
+                                            | Ok _ -> Ok (`Outcome (Assigned { job = assigned_job;
+                                                attempt; worker = reserved_worker })))) in
+  match result with
+  | Error error | Ok (Error error) -> Error (Persistence_error error)
+  | Ok (Ok (`Outcome outcome)) -> Ok outcome
+  | Ok (Ok (`Capacity error)) -> Error (Capacity_rejected error)
+  | Ok (Ok (`Transition error)) -> Error (Transition_rejected error)
+  | Ok (Ok `Attempt_number) -> Error Invalid_attempt_number

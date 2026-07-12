@@ -111,7 +111,13 @@ let test_attempt_transitions () =
   let number = int_value Scalar.Attempt_number.create 1 in
   let assigned = Attempt.create ~id:attempt_id ~job_id ~number ~worker_id ~assigned_at:now in
   Attempt.succeed ~now:(later 1) ~exit_code:0 assigned |> check_error;
-  let running, _ = Attempt.start ~now:(later 1) assigned |> Result.get_ok in
+  Attempt.start ~now:(later 1) assigned |> check_error;
+  let acknowledged = Attempt.acknowledge ~now:(later 1) assigned |> Result.get_ok in
+  let acknowledged_again = Attempt.acknowledge ~now:(later 2) acknowledged |> Result.get_ok in
+  Alcotest.(check string) "idempotent acknowledgement"
+    (Attempt.acknowledged_at acknowledged |> Option.get |> Timestamp.to_rfc3339)
+    (Attempt.acknowledged_at acknowledged_again |> Option.get |> Timestamp.to_rfc3339);
+  let running, _ = Attempt.start ~now:(later 2) acknowledged |> Result.get_ok in
   let succeeded, _ = Attempt.succeed ~now:(later 2) ~exit_code:0 running |> Result.get_ok in
   check_attempt_status Attempt_status.Succeeded succeeded;
   Attempt.fail ~now:(later 3) ~failure:(Failure.create Failure.Unknown) succeeded |> check_error
@@ -168,6 +174,17 @@ let test_worker_capacity_rejections () =
     (worker ~total:(resources 200 200) ())
   |> (function Error Worker.Insufficient_memory -> () | _ -> Alcotest.fail "insufficient memory accepted")
 
+let test_worker_reconfiguration_and_heartbeat () =
+  let reserved = Worker.reserve ~requirements:(resources 500 256) (worker ()) |> Result.get_ok in
+  (match Worker.reconfigure ~name:"smaller" ~labels:Worker_label.Set.empty
+      ~max_concurrency:(int_value Scalar.Concurrency.create 1)
+      ~total_resources:(resources 100 100) reserved with
+   | Error _ -> () | Ok _ -> Alcotest.fail "reconfiguration below reservations succeeded");
+  let updated = Worker.heartbeat ~now:(later 5) reserved |> Result.get_ok in
+  Alcotest.(check int) "heartbeat preserves active jobs" 1 (Worker.active_jobs updated);
+  Alcotest.(check int) "heartbeat preserves CPU reservation" 500
+    (Worker.reserved_resources updated |> Resources.cpu |> Scalar.Cpu_millicores.value)
+
 let test_persistence_restoration () =
   let pending = job () in
   let restored = Job.snapshot pending |> Job.restore |> Result.get_ok in
@@ -200,6 +217,7 @@ let () = Alcotest.run "orchestraml-domain" [
     Alcotest.test_case "scheduler" `Quick test_scheduler;
     Alcotest.test_case "worker capacity" `Quick test_worker_capacity;
     Alcotest.test_case "worker capacity rejections" `Quick test_worker_capacity_rejections;
+    Alcotest.test_case "worker reconfiguration and heartbeat" `Quick test_worker_reconfiguration_and_heartbeat;
     Alcotest.test_case "persistence restoration" `Quick test_persistence_restoration;
   ];
 ]

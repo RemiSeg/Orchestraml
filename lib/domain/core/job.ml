@@ -116,12 +116,20 @@ let release_retry ~now (value : t) = match value.status, value.next_retry_at wit
   | Job_status.Retry_waiting, None -> reject value "release_retry" "retry deadline is missing"
   | _ -> reject value "release_retry" "job is not waiting for retry"
 
-let request_cancel ~now (value : t) = match value.status with
+let cancel_before_execution ~now (value : t) = match value.status with
   | Job_status.Pending | Job_status.Retry_waiting | Job_status.Assigned ->
       (match changed value ~now ~status:Job_status.Cancelled with
        | Ok (updated, event) -> Ok ({ updated with next_retry_at = None }, event)
        | Error _ as error -> error)
-  | Job_status.Running -> changed value ~now ~status:Job_status.Cancelling
+  | _ -> reject value "cancel_before_execution" "job has already entered execution"
+
+let request_execution_cancel ~now (value : t) = match value.status with
+  | Job_status.Assigned | Job_status.Running -> changed value ~now ~status:Job_status.Cancelling
+  | _ -> reject value "request_execution_cancel" "job is not accepted or running"
+
+let request_cancel ~now (value : t) = match value.status with
+  | Job_status.Pending | Job_status.Retry_waiting -> cancel_before_execution ~now value
+  | Job_status.Assigned | Job_status.Running -> request_execution_cancel ~now value
   | _ -> reject value "request_cancel" "job cannot be cancelled from its current state"
 
 let confirm_cancel ~now (value : t) = match value.status with

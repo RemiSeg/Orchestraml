@@ -45,6 +45,10 @@ val start : now:Timestamp.t -> t -> transition
 val complete : now:Timestamp.t -> t -> transition
 val schedule_retry : now:Timestamp.t -> retry_at:Timestamp.t -> reason:string -> t -> transition
 val release_retry : now:Timestamp.t -> t -> transition
+(* Immediately cancels work which has not been accepted for execution. *)
+val cancel_before_execution : now:Timestamp.t -> t -> transition
+(* Requests termination of accepted or running work. *)
+val request_execution_cancel : now:Timestamp.t -> t -> transition
 val request_cancel : now:Timestamp.t -> t -> transition
 val confirm_cancel : now:Timestamp.t -> t -> transition
 val permanently_fail : now:Timestamp.t -> reason:string -> t -> transition

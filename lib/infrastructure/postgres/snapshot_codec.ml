@@ -94,7 +94,8 @@ let attempt_to_string attempt =
   `Assoc ["id",`String (Attempt_id.to_string s.id);"job_id",`String (Job_id.to_string s.job_id);
     "worker_id",`String (Worker_id.to_string s.worker_id);
     "number",`Int (Scalar.Attempt_number.value s.number);"status",`String (Attempt_status.to_string s.status);
-    "assigned_at",`String (Timestamp.to_rfc3339 s.assigned_at);"started_at",timestamp_json s.started_at;
+    "assigned_at",`String (Timestamp.to_rfc3339 s.assigned_at);
+    "acknowledged_at",timestamp_json s.acknowledged_at;"started_at",timestamp_json s.started_at;
     "finished_at",timestamp_json s.finished_at;"outcome",outcome_json s.outcome]
   |> Yojson.Safe.to_string ~std:true
 let attempt_of_string value = protect (fun () ->
@@ -106,6 +107,7 @@ let attempt_of_string value = protect (fun () ->
     number = U.member "number" json |> U.to_int |> Scalar.Attempt_number.create |> unwrap;
     status = U.member "status" json |> U.to_string |> Attempt_status.of_string |> unwrap;
     assigned_at = U.member "assigned_at" json |> U.to_string |> timestamp;
+    acknowledged_at = optional_string json "acknowledged_at" |> Option.map timestamp;
     started_at = optional_string json "started_at" |> Option.map timestamp;
     finished_at = optional_string json "finished_at" |> Option.map timestamp;
     outcome = U.member "outcome" json |> outcome } in

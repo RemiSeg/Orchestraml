@@ -1,0 +1,7 @@
+(include_subdirs qualified)
+
+(library
+ (name orchestraml_worker)
+ (public_name orchestraml.worker)
+ (wrapped true)
+ (libraries orchestraml.domain yojson uri cohttp-eio eio eio.unix uuidm unix cstruct))
