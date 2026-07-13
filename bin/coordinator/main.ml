@@ -2,28 +2,31 @@ open Cmdliner
 module Infrastructure = Orchestraml_infrastructure
 module Coordinator = Orchestraml_coordinator
 module Application = Orchestraml_application
+module Log = Orchestraml_observability.Logger
+
+let log level event message = Log.emit ~level ~component:"coordinator" ~event ~message ()
 
 let configuration () = match Infrastructure.Runtime.Config.load () with
   | Ok value -> value
-  | Error errors -> List.iter prerr_endline errors; exit 2
+  | Error errors -> List.iter (log Log.Error "configuration_invalid") errors; exit 2
 let with_database operation =
   let config = configuration () in
   Eio_main.run @@ fun env -> Eio.Switch.run @@ fun sw ->
   match Infrastructure.Postgres.Database.connect ~sw ~env config.database_url with
-  | Error error -> prerr_endline error; exit 1
+  | Error _ -> log Log.Error "database_connection_failed" "database connection failed"; exit 1
   | Ok database -> operation config env sw database
 let migrate () = with_database (fun config _env _sw database ->
   match Infrastructure.Postgres.Migrations.apply database ~directory:config.migrations_dir with
-  | Ok () -> print_endline "migrations applied"
-  | Error _ -> prerr_endline "migration failed"; exit 1)
+  | Ok () -> log Log.Info "migrations_applied" "database migrations applied"
+  | Error _ -> log Log.Error "migration_failed" "database migration failed"; exit 1)
 let forever ~sw ~clock ~interval name cycle = Eio.Fiber.fork ~sw (fun () ->
   while true do
-    (try cycle () with exn -> Format.eprintf "%s cycle failed: %s@." name (Printexc.to_string exn));
+    (try cycle () with _ -> log Log.Error "maintenance_cycle_failed" (name ^ " cycle failed"));
     Eio.Time.sleep clock interval
   done)
 let serve () = with_database (fun config env sw database ->
   match Infrastructure.Postgres.Migrations.check_current database ~directory:config.migrations_dir with
-  | Error _ -> prerr_endline "database migrations are not current"; exit 1
+  | Error _ -> log Log.Error "migration_check_failed" "database migrations are not current"; exit 1
   | Ok () ->
       let persistence = Infrastructure.Postgres.Persistence.create database in
       let clock = Infrastructure.Runtime.System_clock.create () in
@@ -36,6 +39,11 @@ let serve () = with_database (fun config env sw database ->
         |> Result.get_ok in
       let scheduling = Application.Services.Scheduling_service.create ~persistence ~clock ~ids ~health_policy in
       let execution = Application.Services.Execution_service.create ~persistence ~clock in
+      let logs = Application.Services.Log_service.create ~persistence ~clock in
+      let containers = Application.Services.Container_service.create ~persistence in
+      let metrics = Application.Services.Metrics_service.create ~persistence ~clock
+        ~suspect_after_seconds:config.worker_suspect_after
+        ~offline_after_seconds:config.worker_offline_after in
       let retry = Application.Services.Retry_service.create ~persistence ~clock in
       let seconds value = Orchestraml_domain.Foundation.Scalar.Timeout_seconds.create value |> Result.get_ok in
       let maintenance = Application.Services.Maintenance_service.create
@@ -45,7 +53,8 @@ let serve () = with_database (fun config env sw database ->
         ~recovery_grace:(seconds config.heartbeat_recovery_grace)
         ~batch_size:config.maintenance_batch_size in
       (match Application.Services.Maintenance_service.reconcile_startup maintenance with
-       | Ok _ -> () | Error _ -> prerr_endline "startup reconciliation failed"; exit 1);
+       | Ok _ -> log Log.Info "startup_reconciled" "startup reconciliation completed"
+       | Error _ -> log Log.Error "startup_reconciliation_failed" "startup reconciliation failed"; exit 1);
       forever ~sw ~clock:env#clock ~interval:config.scheduler_interval "scheduler" (fun () ->
         ignore (Application.Services.Scheduling_service.run_once scheduling));
       forever ~sw ~clock:env#clock ~interval:config.retry_interval "retry" (fun () ->
@@ -58,9 +67,11 @@ let serve () = with_database (fun config env sw database ->
         ignore (Application.Services.Maintenance_service.run_worker_recovery_cycle maintenance));
       forever ~sw ~clock:env#clock ~interval:config.maintenance_interval "heartbeat-reconciliation" (fun () ->
         ignore (Application.Services.Maintenance_service.run_heartbeat_reconciliation_cycle maintenance));
-      let router = Coordinator.Api.Router.create ~jobs ~workers ~scheduling ~execution
+      let router = Coordinator.Api.Router.create ~jobs ~workers ~scheduling ~execution ~logs ~containers ~metrics
         ~health:(fun () -> Result.is_ok (Infrastructure.Postgres.Database.health database)) in
-      Coordinator.Server.Http_server.run ~sw ~net:env#net
+      log Log.Info "server_starting" "coordinator HTTP server starting";
+      Coordinator.Server.Http_server.run ~sw ~net:env#net ~clock:env#clock
+        ~follow_interval:config.log_follow_poll
         ~listen_address:config.listen_address ~port:config.port router)
 let migrate_cmd = Cmd.v (Cmd.info "migrate" ~doc:"Apply pending database migrations")
   Term.(const migrate $ const ())

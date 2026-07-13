@@ -1,4 +1,7 @@
 FROM ocaml/opam:debian-12-ocaml-5.2@sha256:fb0e032e3b8d6e0119e8d35f5c9663f7fa90ac356ac79ed632c0f561624bcb62
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends docker.io libpq-dev libgmp-dev pkg-config && rm -rf /var/lib/apt/lists/*
+USER opam
 
 WORKDIR /workspace
 COPY --chown=opam:opam orchestraml.opam dune-project ./

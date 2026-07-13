@@ -66,7 +66,27 @@ let test_scalars_and_labels () =
 
 let test_execution_specs () =
   Execution_spec.command ~executable:" " ~arguments:[] |> (function Error _ -> () | Ok _ -> Alcotest.fail "empty command accepted");
-  Execution_spec.container ~image:"alpine:3" ~command:["echo"] |> (function Ok _ -> () | Error e -> Alcotest.failf "%a" Validation_error.pp e)
+  let container = Execution_spec.container ~image:"alpine:3" ~command:["echo"] |> get_ok in
+  Alcotest.(check bool) "container requires Docker" true (Execution_spec.requires_docker container);
+  let value = Job.create ~id:job_id ~name:(Scalar.Job_name.create "container job" |> get_ok)
+    ~execution:container ~priority:(Scalar.Priority.create 0) ~requirements:(resources 0 0)
+    ~required_labels:(labels ["linux"]) ~retry_policy:(retry_policy ())
+    ~timeout:(int_value Scalar.Timeout_seconds.create 30) ~created_at:now in
+  Alcotest.(check bool) "submitted labels unchanged" false
+    (Worker_label.Set.mem (Worker_label.create "docker" |> get_ok) (Job.required_labels value));
+  Alcotest.(check bool) "effective labels include Docker" true
+    (Worker_label.Set.mem (Worker_label.create "docker" |> get_ok) (Job.effective_required_labels value))
+
+let test_log_values () =
+  Log_entry.sequence 0 |> (function Error _ -> () | Ok _ -> Alcotest.fail "zero log sequence accepted");
+  let sequence = Log_entry.sequence 1 |> get_ok in
+  let binary = "\000\255output" in
+  let entry = Log_entry.create ~attempt_id ~sequence ~stream:Log_entry.Stdout
+    ~observed_at:now ~payload:binary |> get_ok in
+  Alcotest.(check string) "binary payload preserved" binary (Log_entry.payload entry);
+  Log_entry.create ~attempt_id ~sequence ~stream:Log_entry.Stderr ~observed_at:now
+    ~payload:(String.make (16 * 1024 + 1) 'x')
+  |> (function Error _ -> () | Ok _ -> Alcotest.fail "oversized log entry accepted")
 
 let test_job_happy_path_and_terminal () =
   let pending = job () in
@@ -203,6 +223,7 @@ let () = Alcotest.run "orchestraml-domain" [
     Alcotest.test_case "identifiers" `Quick test_identifiers;
     Alcotest.test_case "scalars and labels" `Quick test_scalars_and_labels;
     Alcotest.test_case "execution specs" `Quick test_execution_specs;
+    Alcotest.test_case "log values" `Quick test_log_values;
   ];
   "state machines", [
     Alcotest.test_case "job happy path" `Quick test_job_happy_path_and_terminal;

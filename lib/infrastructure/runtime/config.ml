@@ -4,7 +4,7 @@ type t = { database_url : Uri.t; listen_address : string; port : int;
   worker_suspect_after : int; worker_offline_after : int;
   assignment_ack_timeout : int; execution_report_grace : int;
   heartbeat_recovery_grace : int; maintenance_batch_size : int;
-  startup_reconciliation_max_passes : int }
+  startup_reconciliation_max_passes : int; log_follow_poll : float }
 let env name default = match Sys.getenv_opt name with Some value -> value | None -> default
 let int_env errors name default ~min ~max =
   match int_of_string_opt (env name (string_of_int default)) with
@@ -35,5 +35,9 @@ let load () =
     execution_report_grace = int_env errors "EXECUTION_REPORT_GRACE_SECONDS" 10 ~min:1 ~max:max_int;
     heartbeat_recovery_grace = int_env errors "HEARTBEAT_RECOVERY_GRACE_SECONDS" 20 ~min:1 ~max:max_int;
     maintenance_batch_size = int_env errors "MAINTENANCE_BATCH_SIZE" 100 ~min:1 ~max:1000;
-    startup_reconciliation_max_passes = int_env errors "STARTUP_RECONCILIATION_MAX_PASSES" 1000 ~min:1 ~max:10000 } in
+    startup_reconciliation_max_passes = int_env errors "STARTUP_RECONCILIATION_MAX_PASSES" 1000 ~min:1 ~max:10000;
+    log_follow_poll = (let value = float_env errors "LOG_FOLLOW_POLL_SECONDS" 0.5 in
+      if value < 0.05 || value > 10. then begin
+        errors := "LOG_FOLLOW_POLL_SECONDS must be between 0.05 and 10" :: !errors; 0.5
+      end else value) } in
   match List.rev !errors with [] -> Ok value | errors -> Error errors

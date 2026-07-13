@@ -1,0 +1,10 @@
+{
+  "name": "worker-loss-reassignment",
+  "execution": {"type": "container", "image": "alpine:3.21", "command": ["sleep", "60"]},
+  "priority": 50,
+  "timeout_seconds": 120,
+  "max_attempts": 2,
+  "retry": {"initial_delay_seconds": 1, "multiplier": 2, "maximum_delay_seconds": 2, "retry_timeouts": false},
+  "required_labels": ["shared"],
+  "resources": {"cpu_millicores": 100, "memory_mib": 32}
+}

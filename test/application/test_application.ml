@@ -27,6 +27,8 @@ type fixture = {
   workers : Services.Worker_service.t;
   scheduling : Services.Scheduling_service.t;
   execution : Services.Execution_service.t;
+  logs : Services.Log_service.t;
+  containers : Services.Container_service.t;
   retries : Services.Retry_service.t;
   maintenance : Services.Maintenance_service.t;
 }
@@ -41,6 +43,8 @@ let fixture () =
     workers = Services.Worker_service.create ~persistence ~clock:clock_port ~ids;
     scheduling = Services.Scheduling_service.create ~persistence ~clock:clock_port ~ids ~health_policy;
     execution = Services.Execution_service.create ~persistence ~clock:clock_port;
+    logs = Services.Log_service.create ~persistence ~clock:clock_port;
+    containers = Services.Container_service.create ~persistence;
     retries = Services.Retry_service.create ~persistence ~clock:clock_port;
     maintenance = Services.Maintenance_service.create ~max_reconciliation_passes:1000
       ~persistence ~clock:clock_port ~health_policy
@@ -313,6 +317,70 @@ let test_reconciliation_batches_and_limit () =
   | Error Services.Maintenance_service.Reconciliation_did_not_converge -> ()
   | _ -> Alcotest.fail "reconciliation pass limit was not enforced"
 
+let test_durable_logs () =
+  let fixture = fixture () in
+  ignore (Services.Job_service.submit fixture.jobs submission |> get_ok);
+  let worker = Services.Worker_service.register fixture.workers registration |> get_ok in
+  let assignment = Services.Scheduling_service.run_once fixture.scheduling |> get_ok |> assigned in
+  let make sequence stream payload = Log_entry.create ~attempt_id:(Attempt.id assignment.attempt)
+    ~sequence:(Log_entry.sequence sequence |> get_ok) ~stream ~observed_at:timestamp ~payload |> get_ok in
+  let entries = [make 1 Log_entry.Stdout "one"; make 2 Log_entry.Stderr "\000two"] in
+  Alcotest.(check int) "highest accepted" 2
+    (Services.Log_service.append_batch fixture.logs ~worker_id:(Worker.id worker)
+      ~attempt_id:(Attempt.id assignment.attempt) entries |> get_ok);
+  Alcotest.(check int) "replay accepted" 2
+    (Services.Log_service.append_batch fixture.logs ~worker_id:(Worker.id worker)
+      ~attempt_id:(Attempt.id assignment.attempt) entries |> get_ok);
+  (match Services.Log_service.append_batch fixture.logs ~worker_id:(Worker.id worker)
+      ~attempt_id:(Attempt.id assignment.attempt) [make 2 Log_entry.Stderr "different"] with
+   | Error (Services.Log_service.Persistence_error (Ports.Persistence.Conflict _)) -> ()
+   | _ -> Alcotest.fail "conflicting sequence was accepted");
+  let snapshot = Services.Log_service.follow_snapshot fixture.logs
+    ~attempt_id:(Attempt.id assignment.attempt) ~after_sequence:0 ~limit:10 |> get_ok in
+  Alcotest.(check int) "ordered logs" 2 (List.length snapshot.entries);
+  ignore (Services.Execution_service.acknowledge_attempt fixture.execution
+    (Attempt.id assignment.attempt) |> get_ok);
+  ignore (Services.Execution_service.start_attempt fixture.execution
+    (Attempt.id assignment.attempt) |> get_ok);
+  ignore (Services.Execution_service.report_success fixture.execution
+    (Attempt.id assignment.attempt) ~exit_code:0 |> get_ok);
+  ignore (Services.Log_service.append_batch fixture.logs ~worker_id:(Worker.id worker)
+    ~attempt_id:(Attempt.id assignment.attempt) entries |> get_ok);
+  match Services.Log_service.append_batch fixture.logs ~worker_id:(Worker.id worker)
+      ~attempt_id:(Attempt.id assignment.attempt) [make 3 Log_entry.Stdout "late"] with
+  | Error Services.Log_service.Terminal_attempt -> ()
+  | _ -> Alcotest.fail "new terminal log was accepted"
+
+let test_container_metadata () =
+  let fixture=fixture() in
+  let container_submission={submission with execution=Execution_spec.container ~image:"alpine:3.21"
+      ~command:["true"]|>get_ok;required_labels=Worker_label.Set.empty} in
+  ignore(Services.Job_service.submit fixture.jobs container_submission|>get_ok);
+  let docker_label=Worker_label.create "docker"|>get_ok in
+  let worker=Services.Worker_service.register fixture.workers
+    {registration with labels=Worker_label.Set.singleton docker_label}|>get_ok in
+  let assignment=Services.Scheduling_service.run_once fixture.scheduling|>get_ok|>assigned in
+  let metadata : Ports.Persistence.container_metadata={attempt_id=Attempt.id assignment.attempt;
+    worker_id=Worker.id worker;container_id="container-id";container_name="orchestraml-test";
+    image_reference="alpine:3.21";created_at=timestamp;started_at=None;finished_at=None;
+    removed_at=None;cleanup_outcome=Ports.Persistence.Pending} in
+  ignore(Services.Container_service.record fixture.containers ~worker_id:(Worker.id worker) ~metadata|>get_ok);
+  ignore(Services.Container_service.record fixture.containers ~worker_id:(Worker.id worker) ~metadata|>get_ok);
+  let started={metadata with started_at=Some timestamp} in
+  ignore(Services.Container_service.record fixture.containers ~worker_id:(Worker.id worker) ~metadata:started|>get_ok);
+  (match Services.Container_service.record fixture.containers ~worker_id:(Worker.id worker)
+      ~metadata:{started with container_id="changed"} with
+   |Error(Services.Container_service.Conflict _)->()|_->Alcotest.fail "immutable identity changed");
+  (match Services.Container_service.record fixture.containers ~worker_id:(Worker.id worker) ~metadata with
+   |Error(Services.Container_service.Conflict _)->()|_->Alcotest.fail "lifecycle regressed");
+  let removed={started with finished_at=Some timestamp;removed_at=Some timestamp;
+    cleanup_outcome=Ports.Persistence.Removed} in
+  ignore(Services.Container_service.record fixture.containers ~worker_id:(Worker.id worker) ~metadata:removed|>get_ok);
+  match Services.Container_service.find fixture.containers metadata.attempt_id|>get_ok with
+  |Some stored->Alcotest.(check bool) "removed persisted" true
+      (stored.cleanup_outcome=Ports.Persistence.Removed)
+  |None->Alcotest.fail "container metadata missing"
+
 let () = Alcotest.run "orchestraml-application" [
   "memory", [
     Alcotest.test_case "transaction rollback" `Quick test_transaction_rollback;
@@ -332,5 +400,7 @@ let () = Alcotest.run "orchestraml-application" [
     Alcotest.test_case "deadline and cancellation controls" `Quick test_deadline_and_running_cancellation_controls;
     Alcotest.test_case "unknown process control" `Quick test_unknown_process_control;
     Alcotest.test_case "reconciliation batches and limit" `Quick test_reconciliation_batches_and_limit;
+    Alcotest.test_case "durable logs" `Quick test_durable_logs;
+    Alcotest.test_case "container metadata" `Quick test_container_metadata;
   ];
 ]

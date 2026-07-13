@@ -2,4 +2,4 @@
  (name main)
  (public_name orchestraml-coordinator)
  (libraries orchestraml.domain orchestraml.application orchestraml.infrastructure
-   orchestraml.coordinator eio_main cmdliner))
+   orchestraml.coordinator orchestraml.observability eio_main cmdliner))

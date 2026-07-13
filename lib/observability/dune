@@ -1,0 +1,5 @@
+(library
+ (name orchestraml_observability)
+ (public_name orchestraml.observability)
+ (wrapped true)
+ (libraries yojson ptime.clock.os))

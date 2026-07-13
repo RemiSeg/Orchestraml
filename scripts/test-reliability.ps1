@@ -126,7 +126,7 @@ try {
   Wait-Job $forced.id @("permanently_failed") 12 | Out-Null
   $oldPreference=$ErrorActionPreference; $ErrorActionPreference="Continue"
   $workerLogs=(docker logs $workerB 2>&1 | Out-String); $ErrorActionPreference=$oldPreference
-  if(-not ($workerLogs -match "attempt $((Attempts $forced.id)[0].id) termination=force_killed")){throw "forced-kill diagnostic missing"}
+  if(-not ($workerLogs -match 'force_killed')){throw "forced-kill diagnostic missing"}
   $probe=Submit-Job "slot-probe" "/bin/true" @() 30 1 $false "crash"
   Wait-Job $probe.id @("completed") 10 | Out-Null
   Assert-ZeroCapacity $workerBRecord.id

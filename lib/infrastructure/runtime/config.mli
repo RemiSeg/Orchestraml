@@ -5,5 +5,5 @@ type t = { database_url : Uri.t; listen_address : string; port : int;
   worker_suspect_after : int; worker_offline_after : int;
   assignment_ack_timeout : int; execution_report_grace : int;
   heartbeat_recovery_grace : int; maintenance_batch_size : int;
-  startup_reconciliation_max_passes : int }
+  startup_reconciliation_max_passes : int; log_follow_poll : float }
 val load : unit -> (t, string list) result

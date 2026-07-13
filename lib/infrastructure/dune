@@ -4,5 +4,5 @@
  (name orchestraml_infrastructure)
  (public_name orchestraml.infrastructure)
  (wrapped true)
- (libraries orchestraml.domain orchestraml.application yojson uri caqti caqti-eio caqti-eio.unix
+ (libraries orchestraml.domain orchestraml.application yojson base64 uri caqti caqti-eio caqti-eio.unix
    caqti-driver-postgresql eio eio.unix ptime.clock.os))

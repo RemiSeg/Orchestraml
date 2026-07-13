@@ -128,6 +128,70 @@ let run () =
     | Error _ -> "error") |> List.sort String.compare in
   Alcotest.(check (list string)) "concurrent targeted poll" ["assigned"; "none"] poll_kinds;
   Alcotest.(check int) "one attempt" 1
-    (Services.Job_service.attempts jobs_b (Job.id scheduled_job) |> service_ok |> List.length)
+    (Services.Job_service.attempts jobs_b (Job.id scheduled_job) |> service_ok |> List.length);
+  let assignment = [Option.get !first_poll; Option.get !second_poll] |> List.find_map (function
+    | Ok (Services.Scheduling_service.Assigned value) -> Some value | _ -> None) |> Option.get in
+  let logs = Services.Log_service.create ~persistence:persistence_b ~clock in
+  let entry payload = Log_entry.create ~attempt_id:(Attempt.id assignment.attempt)
+    ~sequence:(Log_entry.sequence 1 |> get_ok) ~stream:Log_entry.Stdout
+    ~observed_at:(clock.now ()) ~payload |> get_ok in
+  ignore (Services.Log_service.append_batch logs ~worker_id ~attempt_id:(Attempt.id assignment.attempt)
+    [entry "durable-output"] |> get_ok);
+  ignore (Services.Log_service.append_batch logs ~worker_id ~attempt_id:(Attempt.id assignment.attempt)
+    [entry "durable-output"] |> get_ok);
+  (match Services.Log_service.append_batch logs ~worker_id ~attempt_id:(Attempt.id assignment.attempt)
+      [entry "conflict"] with
+   | Error (Services.Log_service.Persistence_error (Ports.Persistence.Conflict _)) -> ()
+   | _ -> Alcotest.fail "PostgreSQL accepted conflicting log replay");
+  let logs_after_restart = Services.Log_service.create
+    ~persistence:(Infrastructure.Postgres.Persistence.create database) ~clock in
+  Alcotest.(check int) "logs survive repository recreation" 1
+    (Services.Log_service.list logs_after_restart ~attempt_id:(Attempt.id assignment.attempt)
+      ~after_sequence:0 ~limit:10 |> get_ok |> List.length);
+  let docker_label=Worker_label.create "docker"|>get_ok in
+  let docker_registration={registration with labels=Worker_label.Set.singleton docker_label} in
+  ignore(Services.Worker_service.register_with_id worker_service wrong_worker docker_registration|>get_ok);
+  let container_submission={submission with execution=Execution_spec.container ~image:"alpine:3.21"
+      ~command:["true"]|>get_ok;priority=Scalar.Priority.create 200} in
+  ignore(Services.Job_service.submit jobs_b container_submission|>service_ok);
+  let container_assignment=match Services.Scheduling_service.poll_for_worker scheduling wrong_worker|>get_ok with
+    |Services.Scheduling_service.Assigned value->value|_->Alcotest.fail "container was not assigned" in
+  let observed=clock.now() in
+  let metadata : Ports.Persistence.container_metadata={attempt_id=Attempt.id container_assignment.attempt;
+    worker_id=wrong_worker;container_id="postgres-container";container_name="orchestraml-postgres";
+    image_reference="alpine:3.21";created_at=observed;started_at=None;finished_at=None;removed_at=None;
+    cleanup_outcome=Ports.Persistence.Pending} in
+  let containers=Services.Container_service.create ~persistence:persistence_b in
+  let record()=Services.Container_service.record containers ~worker_id:wrong_worker ~metadata in
+  let left=ref None and right=ref None in Eio.Fiber.both(fun()->left:=Some(record()))(fun()->right:=Some(record()));
+  List.iter(function Ok _->()|Error error->Alcotest.failf "concurrent identical metadata failed: %s"
+      (match error with Services.Container_service.Persistence_error(Ports.Persistence.Storage_failure message)->message
+       |Services.Container_service.Persistence_error(Ports.Persistence.Conflict message)->message
+       |Services.Container_service.Persistence_error _->"persistence"
+       |Services.Container_service.Invalid_metadata message->message
+       |Services.Container_service.Conflict message->message
+       |Services.Container_service.Wrong_worker->"wrong worker"
+       |Services.Container_service.Not_container_attempt->"not container"))
+    [Option.get !left;Option.get !right];
+  (match Services.Container_service.record containers ~worker_id:wrong_worker
+      ~metadata:{metadata with container_id="conflict"} with
+   |Error(Services.Container_service.Conflict _)->()|_->Alcotest.fail "PostgreSQL metadata conflict accepted");
+  let removed={metadata with started_at=Some observed;finished_at=Some observed;removed_at=Some observed;
+    cleanup_outcome=Ports.Persistence.Removed} in
+  (match Services.Container_service.record containers ~worker_id:wrong_worker ~metadata:removed with
+   |Ok _->()|Error error->Alcotest.failf "container removal update failed: %s" (match error with
+     |Services.Container_service.Persistence_error(Ports.Persistence.Storage_failure message)->message
+     |Services.Container_service.Persistence_error(Ports.Persistence.Conflict message)->message
+     |Services.Container_service.Persistence_error _->"persistence"
+     |Services.Container_service.Invalid_metadata message->message
+     |Services.Container_service.Conflict message->message
+     |Services.Container_service.Wrong_worker->"wrong worker"
+     |Services.Container_service.Not_container_attempt->"not container"));
+  let after_restart=Services.Container_service.create
+    ~persistence:(Infrastructure.Postgres.Persistence.create database) in
+  match Services.Container_service.find after_restart metadata.attempt_id|>get_ok with
+  |Some stored->Alcotest.(check bool) "container metadata survives restart" true
+      (stored.cleanup_outcome=Ports.Persistence.Removed)
+  |None->Alcotest.fail "container metadata did not survive restart"
 let () = Alcotest.run "orchestraml-postgres" ["restart",[
   Alcotest.test_case "persist and recreate coordinator dependencies" `Quick run]]

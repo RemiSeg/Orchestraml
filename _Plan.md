@@ -1070,7 +1070,210 @@ Explicit boundaries
 
 Phase 5 adds no Docker execution, durable or live logs, authentication, TLS, distributed coordinator leadership, cross-worker process adoption, exactly-once execution guarantee, workflow dependencies, cron scheduling, web UI, or general CLI. Those concerns remain in later phases or outside the current roadmap.
 
-13. Suggested implementation order
+13. Phase 6 container execution and logs
+
+Purpose
+
+Phase 6 adds controlled Docker execution and durable ordered attempt logs without changing coordinator authority or the Phase 5 recovery model. A Docker-capable worker creates, observes, stops, and removes one container per attempt. Workers upload stdout and stderr incrementally; the coordinator persists them and exposes stored retrieval and live following.
+
+Docker executor structure
+
+Keep the existing worker library and add a Docker executor beside the local-process executor. Use the Docker CLI through direct executable and argument arrays, never through a shell command string. Do not introduce a partial Docker Engine client or another concurrency runtime.
+
+The executor lifecycle is:
+
+```text
+validate Docker capability
+â†’ ensure image is available
+â†’ create uniquely named and labelled container
+â†’ start container
+â†’ attach and drain stdout/stderr
+â†’ wait and inspect exit result
+â†’ report terminal outcome
+â†’ remove container
+```
+
+Use stable Orchestraml labels containing job ID, attempt ID, and worker ID. Persist the worker-observed container ID and cleanup state as operational metadata, not inside attempt statuses.
+
+Docker capability and scheduling
+
+At startup the worker checks whether the Docker CLI and engine are usable. It advertises the normalized `docker` label only when the check succeeds. Container execution automatically requires Docker capability; this rule is derived from `Execution_spec.Container` and must not depend on the submitter remembering to add a label.
+
+The coordinator remains responsible for CPU and memory reservation. The Docker executor translates job resources into Docker CPU and memory limits. Zero CPU or memory means no explicit limit for that dimension. Worker labels and durable reservations continue to determine scheduling eligibility before execution begins.
+
+Image policy
+
+Use the requested image reference exactly as validated. Inspect local availability first and pull only when the image is missing. Invalid or inaccessible image references map to `Invalid_container_image`. Temporary registry, network, or daemon failures use retryable structured failures.
+
+Phase 6 adds no registry credentials, secret injection, private-registry authentication workflow, image allowlist, or signature verification.
+
+Container security defaults
+
+Every container must use non-privileged defaults:
+
+* Never use privileged mode.
+* Do not mount the Docker socket.
+* Do not expose host PID or IPC namespaces.
+* Do not allow arbitrary host volume mounts.
+* Add no Linux capabilities and drop all inherited capabilities where supported.
+* Set `no-new-privileges`.
+* Apply configured CPU and memory limits.
+* Use a writable container filesystem initially so jobs can create temporary files.
+* Enable normal Docker network access initially for internal engineering workloads.
+
+User-selectable mounts, privileged execution, network isolation modes, secrets, and custom security profiles remain outside Phase 6.
+
+Cancellation, timeout, and cleanup
+
+Container cancellation and execution timeout follow the Phase 5 termination contract. Request graceful stop, wait the configured termination grace, then force-kill when necessary. Always wait for terminal container state and attempt removal.
+
+Cleanup is idempotent. A missing container is already clean. Failure to remove a stopped container is recorded as operational cleanup failure and retried by the worker while it remains alive, without changing an already accepted attempt outcome.
+
+On worker startup, inspect containers carrying Orchestraml labels. Containers that do not correspond to a locally active execution are orphans. Phase 6 terminates and removes them; it never adopts or reattaches them. Coordinator recovery continues to classify the associated uncertain attempt through the existing lost-worker rules.
+
+Ordered log model
+
+Represent each captured record with:
+
+```text
+attempt_id
+sequence_number
+stream: stdout | stderr
+observed_at
+payload
+```
+
+The worker assigns one monotonically increasing sequence across both streams, creating a total order for the attempt. Sequence numbers begin at one. The coordinator treats `(attempt_id, sequence_number)` as the idempotency key.
+
+Payloads are bounded chunks rather than assumed line-oriented UTF-8 strings. The JSON protocol transports payloads using base64 so arbitrary process bytes remain valid. API responses may additionally expose decoded text only when valid UTF-8; the stored payload remains authoritative.
+
+Log persistence and migrations
+
+Add immutable migrations:
+
+```text
+011_attempt_logs.sql
+012_container_execution_metadata.sql
+```
+
+`attempt_logs` stores attempt ID, sequence number, stream, worker observation timestamp, payload bytes, and coordinator receipt timestamp. Enforce positive sequence numbers, valid streams, unique `(attempt_id, sequence_number)`, and restricted deletion for attempt history.
+
+Container execution metadata stores attempt, worker, container ID/name, image reference, creation/start/finish/removal timestamps, and cleanup outcome. Validate timestamp chronology and keep one metadata record per attempt.
+
+Extend memory and PostgreSQL persistence through shared contracts. Batch insertion is idempotent: an identical repeated sequence is accepted, while the same sequence with different content returns a typed conflict.
+
+Incremental upload protocol
+
+Add a worker endpoint:
+
+```text
+POST /v1/attempts/{attempt_id}/logs
+```
+
+The request contains one ordered batch and the worker identity. The coordinator verifies attempt ownership, validates strictly increasing sequence numbers within the batch, inserts unseen entries transactionally, and returns the highest durably accepted sequence.
+
+Workers retry temporary upload failures with the existing communication retry behavior. They retain an unacknowledged batch until the coordinator confirms its highest sequence. Terminal result reporting waits until all captured log batches have been acknowledged, so the accepted terminal state never precedes logs already observed by that worker.
+
+Buffering and backpressure
+
+Use a bounded 4 MiB pending-log buffer per attempt. Continue draining stdout and stderr concurrently. When unacknowledged data reaches the limit, apply backpressure to the attached streams rather than dropping logs or growing memory without bound.
+
+Log upload failure must not silently discard data. If shutdown prevents acknowledged delivery, the attempt remains subject to the existing worker-loss recovery model. Durable worker-side log spooling is deferred.
+
+Stored log retrieval
+
+Add:
+
+```text
+GET /v1/attempts/{attempt_id}/logs?after_sequence=0&limit=1000
+```
+
+Return entries ordered by ascending sequence with a nullable next sequence cursor. Default limit is `1000`; maximum is `5000`. Invalid attempt IDs, sequence values, or limits return `400`; missing attempts return `404`.
+
+Live log following
+
+Add Server-Sent Events:
+
+```text
+GET /v1/attempts/{attempt_id}/logs/follow?after_sequence=42
+```
+
+First send stored entries after the supplied sequence, then continue delivering newly committed entries. End the stream after the attempt is terminal and every stored entry has been emitted. A reconnecting client supplies its last received sequence and resumes without missing entries. Duplicate delivery across a reconnect is acceptable and identified by sequence number.
+
+The coordinator may poll PostgreSQL internally for newly committed entries at a validated interval. Slow or disconnected followers must not block worker uploads, terminal reports, or other clients. WebSockets and a general event broker are not introduced.
+
+Worker configuration
+
+Add validated settings for Docker executable path, log batch byte limit, log flush interval, pending-log memory limit, and coordinator follow-poll interval. Defaults are:
+
+```text
+DOCKER_EXECUTABLE              docker
+LOG_BATCH_BYTES                65536
+LOG_FLUSH_INTERVAL_SECONDS     0.5
+LOG_PENDING_LIMIT_BYTES        4194304
+LOG_FOLLOW_POLL_SECONDS        0.5
+```
+
+Testing and acceptance
+
+* Domain tests cover automatic Docker capability requirements and log scalar validation.
+* Executor tests cover image inspection/pull, exact command arguments, success, non-zero exit, invalid image, daemon failure, CPU/memory flags, security flags, graceful stop, forced kill, cleanup, and orphan removal.
+* Log tests cover interleaved stdout/stderr ordering, binary payloads, batch boundaries, bounded buffering, backpressure, duplicate batches, conflicting duplicates, and terminal-report ordering.
+* Memory and PostgreSQL repository contracts cover container metadata, ordered log insertion, pagination, ownership, rollback, and restart persistence.
+* HTTP tests cover log upload, validation, replay/conflict, retrieval, pagination, SSE follow, reconnect, terminal completion, and slow/disconnected followers.
+* Integration tests run a pinned small Linux image, verify enforced resources and security options, capture both streams, follow logs while running, cancel and time out containers, restart the coordinator during upload, and confirm container cleanup.
+* Fault-injection tests stop workers and coordinators while logs are in flight and prove that stored sequences remain ordered and idempotent.
+* All Phase 1â€“5 tests remain green.
+
+Phase 6 is complete when container jobs execute only on Docker-capable workers with controlled resource and security settings, every created container is cleaned or recoverably recorded, and ordered attempt logs remain durably retrievable and followable across retries and coordinator restart.
+
+Explicit boundaries
+
+Phase 6 adds no host mounts, privileged jobs, secret distribution, registry credentials, image trust policy, durable worker-side spool, external log broker, WebSockets, authentication, TLS, multi-coordinator leadership, general CLI, or web UI.
+
+13.7 Phase 7 — First release integration, CLI, observability, and demonstration
+
+Phase 7 closes the first complete release without changing established lifecycle or scheduling semantics.
+
+CLI application
+
+* Add a wrapped HTTP-only CLI library and `orchestraml` executable.
+* Support submission, job listing/inspection, attempts, events, cancellation, workers, and stored/live logs.
+* Use human output by default and stable JSON for automation.
+* Follow logs across SSE reconnects and later retry attempts using per-attempt sequence cursors.
+* Keep API decoding independent from coordinator server DTO implementations.
+
+Operational observability
+
+* Emit coordinator and worker runtime events as JSON lines with severity, component, event, and relevant entity identifiers.
+* Never include credentials, environment values, job payloads, or captured output in operational log fields.
+* Expose a read-only Prometheus `/metrics` snapshot for job states, worker health, retries, terminal duration, active attempts, and incomplete cleanup.
+* Retain `/health` as the bounded PostgreSQL readiness probe.
+
+Release cluster
+
+* Add separate multi-stage coordinator, worker, and CLI release image targets while retaining the development image for tests.
+* Compose PostgreSQL, explicit migration, one coordinator, two Docker-capable workers, one local-only worker, and an on-demand CLI.
+* Persist PostgreSQL and each worker identity independently.
+* Bind the unauthenticated coordinator only to localhost.
+* Treat Docker socket access as trusted local demonstration authority.
+
+Demonstration and acceptance
+
+* Provide pinned, harmless example jobs for labels, priority, resources, success, retries, permanent failure, cancellation, timeout, worker loss, and logs.
+* Drive user-visible operations through the CLI.
+* Reuse the Phase 1–6 unit, property, PostgreSQL, reliability, and container/log suites in one release runner.
+* Map the automated demonstration to all 20 acceptance criteria in `_Requirements.md`.
+* Run release acceptance twice to detect leaked resources or non-idempotent recovery.
+* Provide a canonical root README covering setup, architecture, guarantees, security, operation, tests, troubleshooting, cleanup, and limitations.
+
+Phase 7 is complete when a clean Compose cluster with PostgreSQL, one coordinator, and three differently configured workers is fully operable through the CLI; all acceptance criteria pass automatically; state and logs survive restarts; runtime observability is available; and another engineer can build, demonstrate, test, and clean up the system from the README alone.
+
+Explicit boundaries
+
+Phase 7 adds no authentication, TLS, external-network safety, web UI, workflow engine, cron scheduler, Kubernetes integration, registry credential system, multi-coordinator leadership, or exactly-once execution.
+
+14. Suggested implementation order
 
 The project should be built vertically, not by creating every empty module first.
 
@@ -1122,18 +1325,22 @@ Startup reconciliation and heartbeat disagreement handling
 Controlled-clock, concurrency, fault-injection, and restart tests
 Complete when worker crashes, execution deadlines, cancellation, and coordinator restarts converge to valid durable states without duplicate transitions or leaked capacity.
 Phase 6: Container execution and logs
-Docker executor
-Incremental log upload
-Live log following
-Resource and label matching
-Complete when jobs run in controlled containers and their ordered logs remain observable.
-Phase 7: Testing and demo
-Property-based tests
-Integration cluster
-Fault injection
-Docker Compose
-Demonstration script
-Complete when the acceptance criteria in Requirements.md pass in the demonstrable local cluster.
+Automatic Docker capability matching
+Secure Docker CLI executor with CPU and memory limits
+Container cancellation, timeout, cleanup, and orphan removal
+Sequenced stdout/stderr capture with bounded backpressure
+Idempotent batched log upload and PostgreSQL storage
+Stored log pagination and SSE live following
+Container, log, restart, and fault-injection tests
+Complete when controlled container jobs execute on Docker-capable workers and their ordered logs remain durable and observable.
+Phase 7: First release integration and demonstration
+HTTP-only CLI with human and JSON output
+Structured operational logs and basic metrics
+Separate release container targets
+Three-worker Docker Compose cluster
+Pinned example jobs and CLI demonstration
+Consolidated release acceptance and final documentation
+Complete when all 20 acceptance criteria in `_Requirements.md` pass in the documented local cluster.
 
 The central design principle should be:
 

@@ -10,6 +10,11 @@ type registration = { worker_id : Worker_id.t; name : string; labels : Worker_la
   max_concurrency : Scalar.Concurrency.t; resources : Resources.t }
 type result_report = Succeeded of int | Failed of Failure.t | Timed_out | Cancelled
 type control = Cancel of Attempt_id.t | Execution_timeout of Attempt_id.t | Stop_unknown of Attempt_id.t
+type cleanup = Pending | Removed | Cleanup_failed
+type container_metadata = { attempt_id:Attempt_id.t; worker_id:Worker_id.t;
+  container_id:string; container_name:string; image_reference:string;
+  created_at:Timestamp.t; started_at:Timestamp.t option; finished_at:Timestamp.t option;
+  removed_at:Timestamp.t option; cleanup:cleanup }
 type error = Transport of string | Protocol of int * string | Invalid_response of string
 type t = { client : Cohttp_eio.Client.t; base_uri : Uri.t;
   with_timeout : 'a. (unit -> 'a) -> 'a }
@@ -92,6 +97,46 @@ let report ~sw value id report =
     | Timed_out -> `Assoc ["type", `String "timed_out"]
     | Cancelled -> `Assoc ["type", `String "cancelled"] in
   call ~sw value `POST ("/v1/attempts/" ^ Attempt_id.to_string id ^ "/result") json |> unit_response
+let upload_logs ~sw value ~worker_id ~attempt_id entries =
+  let entry value = `Assoc [
+    "sequence",`Int Log_entry.(sequence_number value |> sequence_value);
+    "stream",`String (Log_entry.stream value |> Log_entry.stream_to_string);
+    "observed_at",`String (Log_entry.observed_at value |> Timestamp.to_rfc3339);
+    "payload_base64",`String (Base64.encode_exn (Log_entry.payload value))] in
+  match call ~sw value `POST ("/v1/attempts/" ^ Attempt_id.to_string attempt_id ^ "/logs")
+    (`Assoc ["worker_id",`String (Worker_id.to_string worker_id);
+      "entries",`List (List.map entry entries)]) with
+  | Error _ as error -> error
+  | Ok (200, body) -> (try Ok (Yojson.Safe.from_string body |> U.member "highest_accepted_sequence" |> U.to_int)
+      with _ -> Error (Invalid_response "coordinator returned invalid log acknowledgement"))
+  | Ok (status, body) -> Error (Protocol (status, body))
+let timestamp = function None->`Null|Some value->`String(Timestamp.to_rfc3339 value)
+let container_json value = `Assoc ["worker_id",`String(Worker_id.to_string value.worker_id);
+  "container_id",`String value.container_id;"container_name",`String value.container_name;
+  "image_reference",`String value.image_reference;"created_at",`String(Timestamp.to_rfc3339 value.created_at);
+  "started_at",timestamp value.started_at;"finished_at",timestamp value.finished_at;
+  "removed_at",timestamp value.removed_at;"cleanup_outcome",`String(match value.cleanup with
+    |Pending->"pending"|Removed->"removed"|Cleanup_failed->"failed")]
+let record_container ~sw client metadata = call ~sw client `PUT
+  ("/v1/attempts/"^Attempt_id.to_string metadata.attempt_id^"/container")
+  (container_json metadata) |> unit_response
+let timestamp_of_json name json=match U.member name json with `Null->None|value->
+  Some(U.to_string value|>Timestamp.of_rfc3339|>unwrap)
+let container_of_json json = {
+  attempt_id=U.member "attempt_id" json|>U.to_string|>Attempt_id.of_string|>unwrap;
+  worker_id=U.member "worker_id" json|>U.to_string|>Worker_id.of_string|>unwrap;
+  container_id=U.member "container_id" json|>U.to_string;
+  container_name=U.member "container_name" json|>U.to_string;
+  image_reference=U.member "image_reference" json|>U.to_string;
+  created_at=U.member "created_at" json|>U.to_string|>Timestamp.of_rfc3339|>unwrap;
+  started_at=timestamp_of_json "started_at" json;finished_at=timestamp_of_json "finished_at" json;
+  removed_at=timestamp_of_json "removed_at" json;cleanup=(match U.member "cleanup_outcome" json|>U.to_string with
+    |"pending"->Pending|"removed"->Removed|"failed"->Cleanup_failed|_->failwith "invalid cleanup outcome")}
+let find_container ~sw client attempt_id = match call ~sw client `GET
+    ("/v1/attempts/"^Attempt_id.to_string attempt_id^"/container") `Null with
+  |Error _ as error->error|Ok(404,_)->Ok None|Ok(200,body)->(try Ok(Some(Yojson.Safe.from_string body|>container_of_json))
+      with _->Error(Invalid_response "coordinator returned invalid container metadata"))
+  |Ok(status,body)->Error(Protocol(status,body))
 let pp_error formatter = function
   | Transport message | Invalid_response message -> Format.pp_print_string formatter message
   | Protocol (status, body) -> Format.fprintf formatter "coordinator returned %d: %s" status body

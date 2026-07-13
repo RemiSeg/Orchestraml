@@ -17,6 +17,20 @@ type control_kind = Cancel | Execution_timeout | Stop_unknown
 type control_request = { attempt_id : Attempt_id.t; worker_id : Worker_id.t;
   kind : control_kind; requested_at : Timestamp.t; delivered_at : Timestamp.t option;
   completed_at : Timestamp.t option }
+type cleanup_outcome = Pending | Removed | Cleanup_failed
+type container_metadata = { attempt_id : Attempt_id.t; worker_id : Worker_id.t;
+  container_id : string; container_name : string; image_reference : string;
+  created_at : Timestamp.t; started_at : Timestamp.t option;
+  finished_at : Timestamp.t option; removed_at : Timestamp.t option;
+  cleanup_outcome : cleanup_outcome }
+type metrics_snapshot = {
+  pending_jobs : int; assigned_jobs : int; running_jobs : int;
+  retry_waiting_jobs : int; cancelling_jobs : int; completed_jobs : int;
+  permanently_failed_jobs : int; cancelled_jobs : int;
+  healthy_workers : int; suspect_workers : int; offline_workers : int;
+  retry_count : int; average_terminal_job_duration_seconds : float;
+  active_attempts : int; incomplete_container_cleanups : int;
+}
 
 type job_repository = {
   create_job : Job.t -> (unit, error) result;
@@ -72,6 +86,20 @@ type event_repository = {
   list_events : unit -> (Domain_event.t list, error) result;
   list_events_for_entity : Domain_event.entity -> (Domain_event.t list, error) result;
 }
+type log_repository = {
+  append_log_batch : attempt_id:Attempt_id.t -> entries:Log_entry.t list -> received_at:Timestamp.t -> (int, error) result;
+  list_logs : attempt_id:Attempt_id.t -> after_sequence:int -> limit:int -> (Log_entry.t list, error) result;
+  highest_log_sequence : Attempt_id.t -> (int option, error) result;
+}
+type container_repository = {
+  record_container_metadata : container_metadata -> (container_metadata, error) result;
+  find_container_metadata : Attempt_id.t -> (container_metadata option, error) result;
+  list_incomplete_container_cleanup : limit:int -> (container_metadata list, error) result;
+}
+type metrics_repository = {
+  snapshot : now:Timestamp.t -> suspect_before:Timestamp.t ->
+    offline_before:Timestamp.t -> (metrics_snapshot, error) result;
+}
 
 type repositories = {
   jobs : job_repository;
@@ -79,6 +107,9 @@ type repositories = {
   workers : worker_repository;
   events : event_repository;
   controls : control_repository;
+  logs : log_repository;
+  containers : container_repository;
+  metrics : metrics_repository;
 }
 
 type t = {

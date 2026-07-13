@@ -1,0 +1,5 @@
+(library
+ (name orchestraml_cli)
+ (public_name orchestraml.cli)
+ (wrapped true)
+ (libraries yojson uri cohttp-eio eio base64))

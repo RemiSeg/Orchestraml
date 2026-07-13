@@ -30,6 +30,7 @@ val status : t -> Job_status.t
 val priority : t -> Scalar.Priority.t
 val requirements : t -> Resources.t
 val required_labels : t -> Worker_label.Set.t
+val effective_required_labels : t -> Worker_label.Set.t
 val retry_policy : t -> Retry_policy.t
 val timeout : t -> Scalar.Timeout_seconds.t
 val idempotency_key : t -> Idempotency_key.t option

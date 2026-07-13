@@ -17,19 +17,22 @@ module Store = struct
     missing_since : (Attempt_id.t, Timestamp.t) Hashtbl.t;
     claimed_assignments : (Attempt_id.t, Timestamp.t) Hashtbl.t;
     stop_requests : (string, Persistence.control_request) Hashtbl.t;
+    logs : (string, Log_entry.t) Hashtbl.t;
+    containers : (Attempt_id.t, Persistence.container_metadata) Hashtbl.t;
   }
   let create () = { jobs = Hashtbl.create 32; attempts = Hashtbl.create 32;
     workers = Hashtbl.create 16; idempotency = Hashtbl.create 16; events = [];
     heartbeats = Hashtbl.create 16; controls = Hashtbl.create 16;
     missing_since = Hashtbl.create 16; claimed_assignments = Hashtbl.create 16;
-    stop_requests = Hashtbl.create 16 }
+    stop_requests = Hashtbl.create 16; logs = Hashtbl.create 64; containers = Hashtbl.create 16 }
   let snapshot value = { jobs = Hashtbl.copy value.jobs;
     attempts = Hashtbl.copy value.attempts; workers = Hashtbl.copy value.workers;
     idempotency = Hashtbl.copy value.idempotency;
     events = value.events; heartbeats = Hashtbl.copy value.heartbeats;
     controls = Hashtbl.copy value.controls; missing_since = Hashtbl.copy value.missing_since;
     claimed_assignments = Hashtbl.copy value.claimed_assignments;
-    stop_requests = Hashtbl.copy value.stop_requests }
+    stop_requests = Hashtbl.copy value.stop_requests; logs = Hashtbl.copy value.logs;
+    containers = Hashtbl.copy value.containers }
   let replace target source =
     Hashtbl.clear target;
     Hashtbl.iter (Hashtbl.replace target) source
@@ -43,6 +46,8 @@ module Store = struct
     replace value.missing_since saved.missing_since;
     replace value.claimed_assignments saved.claimed_assignments;
     replace value.stop_requests saved.stop_requests;
+    replace value.logs saved.logs;
+    replace value.containers saved.containers;
     value.events <- saved.events
   let jobs value = value.jobs
   let attempts value = value.attempts
@@ -216,8 +221,80 @@ let repositories store =
           { request with delivered_at = Some (Option.value ~default:completed_at request.delivered_at);
             completed_at = Some completed_at }; Ok ());
   } in
+  let log_key attempt_id sequence = Attempt_id.to_string attempt_id ^ ":" ^ string_of_int sequence in
+  let logs : Persistence.log_repository = {
+    append_log_batch = (fun ~attempt_id ~entries ~received_at:_ ->
+      if not (Hashtbl.mem attempts attempt_id) then Error (missing Persistence.Attempt (Attempt_id.to_string attempt_id))
+      else
+        let rec append highest = function
+          | [] -> Ok highest
+          | entry :: rest ->
+              let sequence = Log_entry.sequence_number entry |> Log_entry.sequence_value in
+              if not (Attempt_id.equal attempt_id (Log_entry.attempt_id entry)) then
+                Error (Persistence.Conflict "log entry attempt does not match request")
+              else let key = log_key attempt_id sequence in
+                match Hashtbl.find_opt store.logs key with
+                | Some stored when Log_entry.equal stored entry -> append (max highest sequence) rest
+                | Some _ -> Error (Persistence.Conflict "log sequence content conflicts")
+                | None -> Hashtbl.add store.logs key entry; append (max highest sequence) rest in
+        append 0 entries);
+    list_logs = (fun ~attempt_id ~after_sequence ~limit ->
+      if not (Hashtbl.mem attempts attempt_id) then Error (missing Persistence.Attempt (Attempt_id.to_string attempt_id))
+      else Ok (all store.logs |> List.filter (fun entry ->
+        Attempt_id.equal attempt_id (Log_entry.attempt_id entry)
+        && Log_entry.(sequence_number entry |> sequence_value) > after_sequence)
+        |> List.sort (fun a b -> Int.compare Log_entry.(sequence_number a |> sequence_value)
+          Log_entry.(sequence_number b |> sequence_value)) |> take limit));
+    highest_log_sequence = (fun attempt_id ->
+      if not (Hashtbl.mem attempts attempt_id) then Error (missing Persistence.Attempt (Attempt_id.to_string attempt_id))
+      else Ok (all store.logs |> List.filter (fun entry -> Attempt_id.equal attempt_id (Log_entry.attempt_id entry))
+        |> List.fold_left (fun value entry -> max value Log_entry.(sequence_number entry |> sequence_value)) 0
+        |> function 0 -> None | value -> Some value));
+  } in
+  let containers : Persistence.container_repository = {
+    record_container_metadata = (fun value ->
+      Hashtbl.replace store.containers value.attempt_id value; Ok value);
+    find_container_metadata = (fun id -> Ok (Hashtbl.find_opt store.containers id));
+    list_incomplete_container_cleanup = (fun ~limit -> Ok (all store.containers |> List.filter
+      (fun value -> value.Persistence.cleanup_outcome <> Persistence.Removed) |> take limit));
+  } in
+  let metrics : Persistence.metrics_repository = {
+    snapshot = (fun ~now:_ ~suspect_before ~offline_before ->
+      let jobs_values = all jobs and worker_values = all workers
+      and attempt_values = all attempts in
+      let count_status status = List.fold_left (fun count job ->
+        if Job_status.equal (Job.status job) status then count + 1 else count) 0 jobs_values in
+      let healthy, suspect, offline = List.fold_left (fun (healthy, suspect, offline) worker ->
+        let heartbeat = Worker.last_heartbeat worker in
+        if Timestamp.compare heartbeat offline_before <= 0 then (healthy, suspect, offline + 1)
+        else if Timestamp.compare heartbeat suspect_before <= 0 then (healthy, suspect + 1, offline)
+        else (healthy + 1, suspect, offline)) (0, 0, 0) worker_values in
+      let terminal_durations = List.filter_map (fun job ->
+        match Job.status job with
+        | Job_status.Completed | Job_status.Permanently_failed | Job_status.Cancelled ->
+            Timestamp.diff_seconds ~later:(Job.updated_at job) ~earlier:(Job.created_at job)
+        | _ -> None) jobs_values in
+      let average = match terminal_durations with
+        | [] -> 0.
+        | values -> float_of_int (List.fold_left ( + ) 0 values) /. float_of_int (List.length values) in
+      Ok { Persistence.pending_jobs = count_status Job_status.Pending;
+        assigned_jobs = count_status Job_status.Assigned; running_jobs = count_status Job_status.Running;
+        retry_waiting_jobs = count_status Job_status.Retry_waiting;
+        cancelling_jobs = count_status Job_status.Cancelling;
+        completed_jobs = count_status Job_status.Completed;
+        permanently_failed_jobs = count_status Job_status.Permanently_failed;
+        cancelled_jobs = count_status Job_status.Cancelled;
+        healthy_workers = healthy; suspect_workers = suspect; offline_workers = offline;
+        retry_count = List.fold_left (fun count job -> count + max 0 (Job.attempts_started job - 1)) 0 jobs_values;
+        average_terminal_job_duration_seconds = average;
+        active_attempts = List.fold_left (fun count attempt -> match Attempt.status attempt with
+          | Attempt_status.Assigned | Attempt_status.Running -> count + 1 | _ -> count) 0 attempt_values;
+        incomplete_container_cleanups = List.fold_left (fun count value ->
+          if value.Persistence.cleanup_outcome = Persistence.Removed then count else count + 1)
+          0 (all store.containers) });
+  } in
   { Persistence.jobs = job_repository; attempts = attempt_repository;
-    workers = worker_repository; events = event_repository; controls }
+    workers = worker_repository; events = event_repository; controls; logs; containers; metrics }
 
 let create () =
   let store = Store.create () in

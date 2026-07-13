@@ -8,22 +8,23 @@ module Tail = struct
     if length > value.limit then
       let retained = Buffer.sub value.buffer (length - value.limit) value.limit in
       Buffer.clear value.buffer; Buffer.add_string value.buffer retained
-  let single_write value buffers =
+  let single_write ?on_output ?stream value buffers =
+    (match on_output,stream with Some emit,Some stream -> List.iter (fun data -> emit stream (Cstruct.to_string data)) buffers | _ -> ());
     List.iter (fun data -> Buffer.add_string value.buffer (Cstruct.to_string data)) buffers;
     trim value;
     List.fold_left (fun total data -> total + Cstruct.length data) 0 buffers
-  let copy value ~src =
+  let copy ?on_output ?stream value ~src =
     let buffer = Cstruct.create 4096 in
     try while true do
       let length = Eio.Flow.single_read src buffer in
-      ignore (single_write value [Cstruct.sub buffer 0 length])
+      ignore (single_write ?on_output ?stream value [Cstruct.sub buffer 0 length])
     done with End_of_file -> ()
-  let create limit =
+  let create ?on_output ?stream limit =
     let value = { buffer = Buffer.create (min limit 4096); limit } in
     let module Sink = struct
       type nonrec t = t
-      let single_write = single_write
-      let copy = copy
+      let single_write value buffers = single_write ?on_output ?stream value buffers
+      let copy value ~src = copy ?on_output ?stream value ~src
     end in
     value, Eio.Resource.T (value, Eio.Flow.Pi.sink (module Sink))
   let contents value = Buffer.contents value.buffer
@@ -43,14 +44,14 @@ let classify_start_error exn =
       || contains normalized "enoent" then Failure.Missing_executable
     else Failure.Invalid_command in
   Failure.create ~message kind
-let start ~sw ~process_mgr specification =
+let start ~sw ~process_mgr ?on_output specification =
   Execution_spec.fold specification
     ~container:(fun _ _ -> Error (Failure.create ~message:"container execution begins in Phase 6"
       Failure.Invalid_configuration))
     ~command:(fun executable arguments ->
       try
-        let stdout, stdout_sink = Tail.create (64 * 1024) in
-        let stderr, stderr_sink = Tail.create (64 * 1024) in
+        let stdout, stdout_sink = Tail.create ?on_output ~stream:Log_entry.Stdout (64 * 1024) in
+        let stderr, stderr_sink = Tail.create ?on_output ~stream:Log_entry.Stderr (64 * 1024) in
         let process = Eio.Process.spawn ~sw process_mgr ~stdout:stdout_sink ~stderr:stderr_sink
           ~executable (executable :: arguments) in
         Ok { wait = (fun () -> Eio.Process.await process);

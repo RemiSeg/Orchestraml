@@ -1,0 +1,10 @@
+{
+  "name": "high-priority",
+  "execution": {"type": "container", "image": "alpine:3.21", "command": ["echo", "high"]},
+  "priority": 100,
+  "timeout_seconds": 20,
+  "max_attempts": 1,
+  "retry": {"initial_delay_seconds": 1, "multiplier": 2, "maximum_delay_seconds": 4, "retry_timeouts": false},
+  "required_labels": ["shared"],
+  "resources": {"cpu_millicores": 100, "memory_mib": 32}
+}

@@ -21,3 +21,4 @@ let container ~image ~command =
 let fold ~command ~container = function
   | Command value -> command value.executable value.arguments
   | Container value -> container value.image value.command
+let requires_docker = function Command _ -> false | Container _ -> true

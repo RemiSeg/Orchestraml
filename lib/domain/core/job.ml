@@ -37,6 +37,12 @@ let status (value : t) = value.status
 let priority (value : t) = value.priority
 let requirements (value : t) = value.requirements
 let required_labels (value : t) = value.required_labels
+let effective_required_labels (value : t) =
+  if Execution_spec.requires_docker value.execution then
+    match Worker_label.create "docker" with
+    | Ok label -> Worker_label.Set.add label value.required_labels
+    | Error _ -> value.required_labels
+  else value.required_labels
 let retry_policy (value : t) = value.retry_policy
 let timeout (value : t) = value.timeout
 let idempotency_key (value : t) = value.idempotency_key

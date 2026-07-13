@@ -10,7 +10,7 @@ let evaluate ~health_policy ~now ~job ~worker =
   let health = Worker_health.classify health_policy ~now ~last_heartbeat:(Worker.last_heartbeat worker) in
   if not (Worker_health.equal health Worker_health.Healthy) then
     reasons := Worker_not_healthy health :: !reasons;
-  let missing = Worker_label.Set.diff (Job.required_labels job) (Worker.labels worker) in
+  let missing = Worker_label.Set.diff (Job.effective_required_labels job) (Worker.labels worker) in
   if not (Worker_label.Set.is_empty missing) then reasons := Missing_labels missing :: !reasons;
   if Worker.free_slots worker <= 0 then reasons := No_concurrency :: !reasons;
   let required = Job.requirements job and available = Worker.available_resources worker in

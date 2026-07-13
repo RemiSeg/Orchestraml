@@ -4,4 +4,4 @@
  (name orchestraml_worker)
  (public_name orchestraml.worker)
  (wrapped true)
- (libraries orchestraml.domain yojson uri cohttp-eio eio eio.unix uuidm unix cstruct))
+ (libraries orchestraml.domain orchestraml.observability yojson base64 uri cohttp-eio eio eio.unix uuidm unix cstruct ptime.clock.os))

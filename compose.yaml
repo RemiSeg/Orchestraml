@@ -7,8 +7,6 @@ services:
       POSTGRES_USER: orchestraml
       POSTGRES_PASSWORD: orchestraml
       POSTGRES_DB: orchestraml
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U orchestraml -d orchestraml"]
       interval: 2s
@@ -17,5 +15,141 @@ services:
     volumes:
       - orchestraml-postgres:/var/lib/postgresql/data
 
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: coordinator
+    image: orchestraml-coordinator:local
+    command: ["migrate"]
+    environment:
+      DATABASE_URL: postgresql://orchestraml:orchestraml@postgres:5432/orchestraml
+      MIGRATIONS_DIR: /app/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  coordinator:
+    image: orchestraml-coordinator:local
+    command: ["serve"]
+    environment:
+      DATABASE_URL: postgresql://orchestraml:orchestraml@postgres:5432/orchestraml
+      MIGRATIONS_DIR: /app/migrations
+      LISTEN_ADDRESS: 0.0.0.0
+      PORT: 8080
+      SCHEDULER_INTERVAL_SECONDS: 0.5
+      RETRY_INTERVAL_SECONDS: 0.5
+      MAINTENANCE_INTERVAL_SECONDS: 1
+      WORKER_SUSPECT_AFTER_SECONDS: 3
+      WORKER_OFFLINE_AFTER_SECONDS: 6
+      ASSIGNMENT_ACK_TIMEOUT_SECONDS: 5
+      EXECUTION_REPORT_GRACE_SECONDS: 1
+      HEARTBEAT_RECOVERY_GRACE_SECONDS: 3
+    ports:
+      - "127.0.0.1:${ORCHESTRAML_HOST_PORT:-18080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  identity-init:
+    image: orchestraml-worker:local
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["chown -R 10001:10001 /identities/general /identities/data /identities/local"]
+    volumes:
+      - worker-general-identity:/identities/general
+      - worker-data-identity:/identities/data
+      - worker-local-identity:/identities/local
+    restart: "no"
+
+  worker-general: &worker-base
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    image: orchestraml-worker:local
+    group_add: ["0"]
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      WORKER_NAME: general-worker
+      WORKER_LABELS: linux,general,shared
+      WORKER_MAX_CONCURRENCY: 2
+      WORKER_CPU_MILLICORES: 2000
+      WORKER_MEMORY_MIB: 1024
+      HEARTBEAT_INTERVAL_SECONDS: 1
+      POLL_INTERVAL_SECONDS: 0.5
+      CONTROL_POLL_INTERVAL_SECONDS: 0.5
+    volumes:
+      - worker-general-identity:/var/lib/orchestraml
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      identity-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker-data:
+    <<: *worker-base
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      WORKER_NAME: data-worker
+      WORKER_LABELS: linux,data,shared
+      WORKER_MAX_CONCURRENCY: 1
+      WORKER_CPU_MILLICORES: 1000
+      WORKER_MEMORY_MIB: 768
+      HEARTBEAT_INTERVAL_SECONDS: 1
+      POLL_INTERVAL_SECONDS: 0.5
+      CONTROL_POLL_INTERVAL_SECONDS: 0.5
+    volumes:
+      - worker-data-identity:/var/lib/orchestraml
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  worker-local:
+    image: orchestraml-worker:local
+    environment:
+      COORDINATOR_URL: http://coordinator:8080
+      WORKER_NAME: local-worker
+      WORKER_LABELS: linux,local
+      WORKER_MAX_CONCURRENCY: 1
+      WORKER_CPU_MILLICORES: 500
+      WORKER_MEMORY_MIB: 256
+      HEARTBEAT_INTERVAL_SECONDS: 1
+      POLL_INTERVAL_SECONDS: 0.5
+      CONTROL_POLL_INTERVAL_SECONDS: 0.5
+    volumes:
+      - worker-local-identity:/var/lib/orchestraml
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      identity-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: cli
+    image: orchestraml-cli:local
+    environment:
+      ORCHESTRAML_COORDINATOR_URL: http://coordinator:8080
+    volumes:
+      - ./examples:/examples:ro
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    profiles: ["tools"]
+
 volumes:
   orchestraml-postgres:
+  worker-general-identity:
+  worker-data-identity:
+  worker-local-identity:

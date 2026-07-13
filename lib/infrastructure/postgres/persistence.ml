@@ -158,6 +158,34 @@ WHERE a.id=c.id RETURNING a.snapshot::text|}
 let workers_stale = R.(Caqti_type.(t2 string int) ->* Caqti_type.string)
   "SELECT snapshot::text FROM workers WHERE last_heartbeat<=?::timestamptz ORDER BY last_heartbeat,id LIMIT ? FOR UPDATE SKIP LOCKED"
 
+let metrics_snapshot = R.(Caqti_type.(t2 string string) ->! Caqti_type.string) {|
+WITH bounds AS (SELECT ?::timestamptz AS suspect_before, ?::timestamptz AS offline_before),
+j AS (SELECT
+  count(*) FILTER (WHERE status='pending')::int pending,
+  count(*) FILTER (WHERE status='assigned')::int assigned,
+  count(*) FILTER (WHERE status='running')::int running,
+  count(*) FILTER (WHERE status='retry_waiting')::int retry_waiting,
+  count(*) FILTER (WHERE status='cancelling')::int cancelling,
+  count(*) FILTER (WHERE status='completed')::int completed,
+  count(*) FILTER (WHERE status='permanently_failed')::int permanently_failed,
+  count(*) FILTER (WHERE status='cancelled')::int cancelled,
+  COALESCE(sum(GREATEST(attempts_started-1,0)),0)::int retries,
+  COALESCE(avg(EXTRACT(EPOCH FROM (updated_at-created_at)))
+    FILTER (WHERE status IN ('completed','permanently_failed','cancelled')),0)::float8 average_duration
+  FROM jobs),
+w AS (SELECT
+  count(*) FILTER (WHERE last_heartbeat>b.suspect_before)::int healthy,
+  count(*) FILTER (WHERE last_heartbeat<=b.suspect_before AND last_heartbeat>b.offline_before)::int suspect,
+  count(*) FILTER (WHERE last_heartbeat<=b.offline_before)::int offline
+  FROM workers CROSS JOIN bounds b),
+a AS (SELECT count(*) FILTER (WHERE status IN ('assigned','running'))::int active FROM job_attempts),
+c AS (SELECT count(*) FILTER (WHERE cleanup_outcome<>'removed')::int incomplete FROM container_execution_metadata)
+SELECT json_build_object('pending',j.pending,'assigned',j.assigned,'running',j.running,
+ 'retry_waiting',j.retry_waiting,'cancelling',j.cancelling,'completed',j.completed,
+ 'permanently_failed',j.permanently_failed,'cancelled',j.cancelled,'healthy',w.healthy,
+ 'suspect',w.suspect,'offline',w.offline,'retries',j.retries,'average_duration',j.average_duration,
+ 'active_attempts',a.active,'incomplete_cleanups',c.incomplete)::text FROM j,w,a,c|}
+
 let control_insert = R.(Caqti_type.(t4 string string string string) ->? Caqti_type.int) {|INSERT INTO attempt_control_requests(attempt_id,worker_id,kind,requested_at)
 VALUES (?::uuid,?::uuid,?,?::timestamptz) ON CONFLICT(attempt_id) DO NOTHING RETURNING 1|}
 let control_poll = R.(Caqti_type.(t3 string string int) ->* Caqti_type.(t6 string string string string (option string) (option string))) {|UPDATE attempt_control_requests SET delivered_at=COALESCE(delivered_at,?::timestamptz)
@@ -183,6 +211,57 @@ RETURNING reported_attempt_id::text,worker_id::text,'stop_unknown',requested_at:
 let stop_confirm = R.(Caqti_type.(t3 string string string) ->? Caqti_type.int) {|WITH p AS (SELECT ?::timestamptz at,?::uuid worker,?::uuid attempt)
 UPDATE worker_stop_requests SET delivered_at=COALESCE(delivered_at,p.at),completed_at=p.at FROM p
 WHERE worker_id=p.worker AND reported_attempt_id=p.attempt RETURNING 1|}
+let logs_append = R.(Caqti_type.(t3 string string string) ->! Caqti_type.int) {|WITH input AS (
+ SELECT ?::uuid attempt_id,(x->>'sequence')::int sequence_number,x->>'stream' stream,
+  (x->>'observed_at')::timestamptz observed_at,decode(x->>'payload','base64') payload,?::timestamptz received_at
+ FROM jsonb_array_elements(?::jsonb) x), conflicts AS (
+ SELECT 1 FROM input i JOIN attempt_logs l USING(attempt_id,sequence_number)
+ WHERE l.stream<>i.stream OR l.observed_at<>i.observed_at OR l.payload<>i.payload), inserted AS (
+ INSERT INTO attempt_logs(attempt_id,sequence_number,stream,observed_at,payload,received_at)
+ SELECT attempt_id,sequence_number,stream,observed_at,payload,received_at FROM input
+ WHERE NOT EXISTS(SELECT 1 FROM conflicts) ON CONFLICT DO NOTHING RETURNING sequence_number)
+SELECT CASE WHEN EXISTS(SELECT 1 FROM conflicts) THEN -1 ELSE COALESCE((SELECT max(sequence_number) FROM input),0) END|}
+let logs_list = R.(Caqti_type.(t3 string int int) ->* Caqti_type.string) {|SELECT jsonb_build_object(
+ 'attempt_id',attempt_id::text,'sequence',sequence_number,'stream',stream,
+ 'observed_at',observed_at::text,'payload',encode(payload,'base64'))::text
+FROM attempt_logs WHERE attempt_id=?::uuid AND sequence_number>? ORDER BY sequence_number LIMIT ?|}
+let logs_highest = R.(Caqti_type.string ->! Caqti_type.(option int))
+  "SELECT max(sequence_number)::int FROM attempt_logs WHERE attempt_id=?::uuid"
+let container_find = R.(Caqti_type.(t2 string string) ->! Caqti_type.(option string)) {|WITH locked AS MATERIALIZED (
+ SELECT pg_advisory_xact_lock(hashtext(?)::bigint)) SELECT (SELECT jsonb_build_object(
+ 'attempt_id',attempt_id::text,'worker_id',worker_id::text,'container_id',container_id,'container_name',container_name,
+ 'image_reference',image_reference,'created_at',created_at::text,'started_at',started_at::text,
+ 'finished_at',finished_at::text,'removed_at',removed_at::text,'cleanup_outcome',cleanup_outcome)::text
+FROM container_execution_metadata WHERE attempt_id=?::uuid) FROM locked|}
+let container_record = R.(Caqti_type.string ->? Caqti_type.string) {|WITH j AS (SELECT ?::jsonb value), upserted AS (
+INSERT INTO container_execution_metadata(attempt_id,worker_id,container_id,container_name,image_reference,created_at,
+ started_at,finished_at,removed_at,cleanup_outcome)
+SELECT (value->>'attempt_id')::uuid,(value->>'worker_id')::uuid,value->>'container_id',value->>'container_name',
+ value->>'image_reference',(value->>'created_at')::timestamptz,(value->>'started_at')::timestamptz,
+ (value->>'finished_at')::timestamptz,(value->>'removed_at')::timestamptz,value->>'cleanup_outcome' FROM j
+ON CONFLICT(attempt_id) DO UPDATE SET
+ started_at=COALESCE(container_execution_metadata.started_at,EXCLUDED.started_at),
+ finished_at=COALESCE(container_execution_metadata.finished_at,EXCLUDED.finished_at),
+ removed_at=COALESCE(container_execution_metadata.removed_at,EXCLUDED.removed_at),
+ cleanup_outcome=EXCLUDED.cleanup_outcome
+WHERE container_execution_metadata.attempt_id=EXCLUDED.attempt_id
+ AND container_execution_metadata.worker_id=EXCLUDED.worker_id
+ AND container_execution_metadata.container_id=EXCLUDED.container_id
+ AND container_execution_metadata.container_name=EXCLUDED.container_name
+ AND container_execution_metadata.image_reference=EXCLUDED.image_reference
+ AND container_execution_metadata.created_at=EXCLUDED.created_at
+ AND (container_execution_metadata.started_at IS NULL OR container_execution_metadata.started_at=EXCLUDED.started_at)
+ AND (container_execution_metadata.finished_at IS NULL OR container_execution_metadata.finished_at=EXCLUDED.finished_at)
+ AND (container_execution_metadata.removed_at IS NULL OR container_execution_metadata.removed_at=EXCLUDED.removed_at)
+RETURNING *) SELECT jsonb_build_object(
+ 'attempt_id',attempt_id::text,'worker_id',worker_id::text,'container_id',container_id,'container_name',container_name,
+ 'image_reference',image_reference,'created_at',created_at::text,'started_at',started_at::text,
+ 'finished_at',finished_at::text,'removed_at',removed_at::text,'cleanup_outcome',cleanup_outcome)::text FROM upserted|}
+let container_incomplete = R.(Caqti_type.int ->* Caqti_type.string) {|SELECT jsonb_build_object(
+ 'attempt_id',attempt_id::text,'worker_id',worker_id::text,'container_id',container_id,'container_name',container_name,
+ 'image_reference',image_reference,'created_at',created_at::text,'started_at',started_at::text,
+ 'finished_at',finished_at::text,'removed_at',removed_at::text,'cleanup_outcome',cleanup_outcome)::text
+FROM container_execution_metadata WHERE cleanup_outcome<>'removed' ORDER BY created_at LIMIT ? FOR UPDATE SKIP LOCKED|}
 
 let event_json event =
   let entity_kind, entity_id = match event.Domain_event.entity with
@@ -216,6 +295,51 @@ let event_job = R.(Caqti_type.string ->* Caqti_type.string)
   "SELECT snapshot::text FROM transition_events WHERE job_id=?::uuid ORDER BY id"
 let event_attempt = R.(Caqti_type.string ->* Caqti_type.string)
   "SELECT snapshot::text FROM transition_events WHERE attempt_id=?::uuid ORDER BY id"
+
+let log_json entry = `Assoc [
+  "sequence", `Int Log_entry.(sequence_number entry |> sequence_value);
+  "stream", `String (Log_entry.stream entry |> Log_entry.stream_to_string);
+  "observed_at", `String (Log_entry.observed_at entry |> Timestamp.to_rfc3339);
+  "payload", `String (Base64.encode_exn (Log_entry.payload entry))]
+let log_of_json value = try
+  let json = Yojson.Safe.from_string value in
+  let attempt_id = U.member "attempt_id" json |> U.to_string |> Attempt_id.of_string |> Result.get_ok in
+  let sequence = U.member "sequence" json |> U.to_int |> Log_entry.sequence |> Result.get_ok in
+  let stream = U.member "stream" json |> U.to_string |> Log_entry.stream_of_string |> Result.get_ok in
+  let observed_at = U.member "observed_at" json |> U.to_string |> Timestamp.of_rfc3339 |> Result.get_ok in
+  let payload = U.member "payload" json |> U.to_string |> Base64.decode_exn in
+  Log_entry.create ~attempt_id ~sequence ~stream ~observed_at ~payload
+  |> Result.map_error (fun _ -> "invalid persisted log entry")
+  with _ -> Error "invalid persisted log entry"
+let optional_timestamp json name = match U.member name json with `Null -> Ok None | value ->
+  U.to_string value |> Timestamp.of_rfc3339 |> Result.map Option.some
+let cleanup_to_string = function Port.Pending -> "pending" | Port.Removed -> "removed"
+  | Port.Cleanup_failed -> "failed"
+let cleanup_of_string = function "pending" -> Ok Port.Pending | "removed" -> Ok Port.Removed
+  | "failed" -> Ok Port.Cleanup_failed | _ -> Error "invalid cleanup outcome"
+let container_json (value : Port.container_metadata) = `Assoc [
+  "attempt_id",`String (Attempt_id.to_string value.attempt_id);
+  "worker_id",`String (Worker_id.to_string value.worker_id);
+  "container_id",`String value.container_id; "container_name",`String value.container_name;
+  "image_reference",`String value.image_reference; "created_at",`String (Timestamp.to_rfc3339 value.created_at);
+  "started_at",(Option.fold ~none:`Null ~some:(fun x -> `String (Timestamp.to_rfc3339 x)) value.started_at);
+  "finished_at",(Option.fold ~none:`Null ~some:(fun x -> `String (Timestamp.to_rfc3339 x)) value.finished_at);
+  "removed_at",(Option.fold ~none:`Null ~some:(fun x -> `String (Timestamp.to_rfc3339 x)) value.removed_at);
+  "cleanup_outcome",`String (cleanup_to_string value.cleanup_outcome)] |> Yojson.Safe.to_string ~std:true
+let container_of_json value = try
+  let json = Yojson.Safe.from_string value in
+  match optional_timestamp json "started_at", optional_timestamp json "finished_at",
+        optional_timestamp json "removed_at", cleanup_of_string (U.member "cleanup_outcome" json |> U.to_string) with
+  | Ok started_at, Ok finished_at, Ok removed_at, Ok cleanup_outcome -> Ok ({
+      Port.attempt_id = U.member "attempt_id" json |> U.to_string |> Attempt_id.of_string |> Result.get_ok;
+      worker_id = U.member "worker_id" json |> U.to_string |> Worker_id.of_string |> Result.get_ok;
+      container_id = U.member "container_id" json |> U.to_string;
+      container_name = U.member "container_name" json |> U.to_string;
+      image_reference = U.member "image_reference" json |> U.to_string;
+      created_at = U.member "created_at" json |> U.to_string |> Timestamp.of_rfc3339 |> Result.get_ok;
+      started_at; finished_at; removed_at; cleanup_outcome } : Port.container_metadata)
+  | _ -> Error "invalid persisted container metadata"
+  with _ -> Error "invalid persisted container metadata"
 
 let repositories (module Db : Caqti_eio.CONNECTION) =
   let exec request value = match Db.exec request value with Ok () -> Ok () | Error error -> Error (storage error) in
@@ -381,7 +505,53 @@ let repositories (module Db : Caqti_eio.CONNECTION) =
       | Ok (Some _) -> Ok () | Ok None -> Error (Port.Conflict "stop control does not belong to worker")
       | Error error -> Error (storage error));
   } in
-  { Port.jobs; attempts; workers; events; controls }
+  let logs : Port.log_repository = {
+    append_log_batch = (fun ~attempt_id ~entries ~received_at ->
+      let json = `List (List.map log_json entries) |> Yojson.Safe.to_string ~std:true in
+      match Db.find logs_append (Attempt_id.to_string attempt_id, Timestamp.to_rfc3339 received_at, json) with
+      | Ok value when value >= 0 -> Ok value
+      | Ok _ -> Error (Port.Conflict "log sequence content conflicts")
+      | Error error -> Error (storage error));
+    list_logs = (fun ~attempt_id ~after_sequence ~limit -> list logs_list log_of_json
+      (Attempt_id.to_string attempt_id, after_sequence, limit));
+    highest_log_sequence = (fun id -> match Db.find logs_highest (Attempt_id.to_string id) with
+      | Ok value -> Ok value | Error error -> Error (storage error));
+  } in
+  let containers : Port.container_repository = {
+    record_container_metadata = (fun value -> match Db.find_opt container_record (container_json value) with
+      | Ok (Some stored) -> container_of_json stored |> Result.map_error (fun message -> Port.Storage_failure message)
+      | Ok None -> Error (Port.Conflict "container metadata conflicts with stored lifecycle")
+      | Error error -> Error (storage error));
+    find_container_metadata = (fun id -> let value=Attempt_id.to_string id in
+      match Db.find container_find (value,value) with
+      |Error error->Error(storage error)|Ok None->Ok None|Ok(Some json)->
+        container_of_json json|>Result.map Option.some|>Result.map_error(fun message->Port.Storage_failure message));
+    list_incomplete_container_cleanup = (fun ~limit -> list container_incomplete container_of_json limit);
+  } in
+  let metrics : Port.metrics_repository = {
+    snapshot = (fun ~now:_ ~suspect_before ~offline_before ->
+      match Db.find metrics_snapshot
+        (Timestamp.to_rfc3339 suspect_before, Timestamp.to_rfc3339 offline_before) with
+      | Error error -> Error (storage error)
+      | Ok encoded ->
+          (try
+             let json = Yojson.Safe.from_string encoded in
+             let int name = U.member name json |> U.to_int in
+             let float name = match U.member name json with
+               | `Int value -> float_of_int value | value -> U.to_float value in
+             Ok { Port.pending_jobs = int "pending"; assigned_jobs = int "assigned";
+               running_jobs = int "running"; retry_waiting_jobs = int "retry_waiting";
+               cancelling_jobs = int "cancelling"; completed_jobs = int "completed";
+               permanently_failed_jobs = int "permanently_failed"; cancelled_jobs = int "cancelled";
+               healthy_workers = int "healthy"; suspect_workers = int "suspect";
+               offline_workers = int "offline"; retry_count = int "retries";
+               average_terminal_job_duration_seconds = float "average_duration";
+               active_attempts = int "active_attempts";
+               incomplete_container_cleanups = int "incomplete_cleanups" }
+           with Yojson.Json_error message | Yojson.Safe.Util.Type_error (message, _) ->
+             Error (Port.Storage_failure ("invalid metrics snapshot: " ^ message))));
+  } in
+  { Port.jobs; attempts; workers; events; controls; logs; containers; metrics }
 
 let create pool =
   { Port.with_transaction = fun operation ->

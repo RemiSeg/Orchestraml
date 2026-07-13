@@ -1,0 +1,4 @@
+(executable
+ (name main)
+ (public_name orchestraml)
+ (libraries orchestraml.cli eio_main eio cohttp-eio cmdliner yojson uri))
