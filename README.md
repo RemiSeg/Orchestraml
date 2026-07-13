@@ -138,7 +138,7 @@ Example input:
 }
 ```
 
-Human-readable output:
+Readable output:
 
 ```text
 8df31a68-9d54-4bc8-a8f2-88f447e4ee38  pending             successful-container
