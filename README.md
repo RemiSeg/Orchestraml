@@ -1,46 +1,46 @@
 # Orchestraml
 
-Orchestraml is a distributed job orchestration platform written in OCaml 5. A durable coordinator schedules validated jobs across heartbeat-reporting workers, stores lifecycle history and logs in PostgreSQL, and recovers from process, worker, and coordinator failures.
+Orchestraml runs jobs across a small pool of workers.
 
-The first release supports priority and label-aware scheduling, CPU and memory reservations, local and controlled Docker execution, retries with exponential backoff, timeouts, cancellation, worker-loss recovery, durable logs, live log following, a CLI, and a reproducible three-worker Compose cluster.
+You submit a command or container job to the coordinator. The coordinator stores it in PostgreSQL, selects a compatible worker, and tracks the job until it succeeds, fails, times out, or is cancelled.
 
-## Architecture
+The first release includes:
+
+- Priority, label, CPU, and memory-aware scheduling.
+- Local-command and Docker-container execution.
+- Automatic retries with exponential backoff.
+- Cancellation, timeouts, and worker-loss recovery.
+- Durable job history and ordered stdout/stderr logs.
+- A command-line client and HTTP API.
+- A local three-worker Docker Compose cluster.
+
+Orchestraml provides **at-least-once execution**. A job may run more than once after an uncertain worker failure, so jobs with external side effects should be idempotent.
+
+## How it is built
+
+| Part | Technology | Purpose |
+|---|---|---|
+| Language | OCaml 5 | Domain rules and runtime applications |
+| Build | Dune and opam | Builds libraries, executables, and tests |
+| Concurrency | Eio | HTTP, worker polling, process execution, and maintenance loops |
+| Database | PostgreSQL and Caqti | Durable state and transactions |
+| HTTP | Cohttp-eio | Coordinator API and worker protocol |
+| JSON | Yojson | API request and response encoding |
+| CLI | Cmdliner | User commands and options |
+| Execution | Docker CLI | Controlled container creation and cleanup |
+| Tests | Alcotest and QCheck | Unit, integration, and property tests |
+
+The repository produces three applications:
 
 ```text
-CLI / HTTP clients
-       |
-       v
-Coordinator ---- PostgreSQL
-       |
-       | trusted polling protocol
-       v
-Worker agents ---- local processes or Docker containers
+orchestraml-coordinator   stores and coordinates work
+orchestraml-worker        executes assigned work
+orchestraml               CLI client for users
 ```
 
-- The coordinator validates, persists, schedules, retries, cancels, and recovers work.
-- PostgreSQL is authoritative for jobs, attempts, workers, reservations, events, controls, logs, and container evidence.
-- Workers advertise capacity, execute assignments, upload ordered output, and report observed outcomes.
-- The CLI is an HTTP client. It never reads PostgreSQL or makes lifecycle decisions.
-- The pure domain library has no HTTP, database, Docker, Eio, environment, or system-clock dependency.
+The development toolchain is containerized. OCaml and opam are not required on the host.
 
-## Security warning
-
-The first release has no authentication or TLS. Compose publishes the coordinator only on `127.0.0.1:8080`. Do not expose it to an untrusted network: submitted jobs can execute commands.
-
-The two Docker-capable demonstration workers mount `/var/run/docker.sock`. Access to that socket is effectively authority over the local Docker engine. This topology is for trusted local development and demonstration.
-
-Job containers are created without privileged mode, host mounts, extra capabilities, host PID/IPC access, or the Docker socket. The executor applies `--cap-drop ALL` and `no-new-privileges`, plus requested CPU and memory limits.
-
-## Prerequisites
-
-- Docker Desktop with Linux containers.
-- Docker Compose v2.
-- PowerShell 7 or Windows PowerShell for the provided acceptance scripts.
-- Port `18080` available on localhost, or set `ORCHESTRAML_HOST_PORT`.
-
-OCaml and opam are not required on the host.
-
-## Start the local cluster
+Build and start the local cluster:
 
 ```powershell
 docker compose build
@@ -48,158 +48,206 @@ docker compose up -d --wait
 docker compose ps
 ```
 
-This starts PostgreSQL, runs migrations explicitly, starts the coordinator, and registers:
+The coordinator is available at `http://127.0.0.1:18080`. Set `ORCHESTRAML_HOST_PORT` to change the host port.
 
-| Worker | Submitted labels | Capacity | Docker |
-|---|---|---|---|
-| `general-worker` | `linux,general,shared` | 2 slots, 2000m CPU, 1024 MiB | yes |
-| `data-worker` | `linux,data,shared` | 1 slot, 1000m CPU, 768 MiB | yes |
-| `local-worker` | `linux,local` | 1 slot, 500m CPU, 256 MiB | no |
-
-Docker-capable workers add the `docker` label only after successful `docker version` and `docker info` probes.
-Compose publishes the coordinator at `http://127.0.0.1:18080`; set `ORCHESTRAML_HOST_PORT` to change only the host-side port.
-
-Run migrations separately when required:
+Stop the cluster while preserving its data:
 
 ```powershell
-docker compose run --rm migrate
+docker compose --profile tools down
 ```
 
-The coordinator refuses to start if migrations are missing, modified, or newer than the executable.
+Remove the cluster and all local Orchestraml data:
 
-## CLI quick start
+```powershell
+docker compose --profile tools down --volumes --remove-orphans
+```
 
-The Compose CLI reaches the coordinator over the internal network:
+## Architecture
+
+```text
+                       HTTP
+CLI or API client --------------> Coordinator
+                                      |
+                                      | transactions
+                                      v
+                                  PostgreSQL
+                                      ^
+                                      |
+                         polling and result reports
+                                      |
+                 +--------------------+--------------------+
+                 |                    |                    |
+           General worker        Data worker          Local worker
+           Docker enabled        Docker enabled       Local commands
+```
+
+The responsibilities are intentionally separate:
+
+- The **coordinator** validates jobs, persists state, schedules work, applies retry rules, and performs recovery.
+- **PostgreSQL** is authoritative for jobs, attempts, workers, reservations, events, controls, logs, and container metadata.
+- A **worker** advertises capacity, executes an assignment, uploads logs, and reports what happened. It does not decide whether to retry.
+- The **CLI** calls the coordinator API. It does not connect to PostgreSQL or contain scheduling rules.
+- The **domain library** contains pure types and rules. It does not depend on HTTP, PostgreSQL, Docker, Eio, environment variables, or the system clock.
+
+The normal data flow is:
+
+```text
+Submit job
+-> persist Pending
+-> select eligible worker
+-> reserve capacity and create attempt
+-> worker acknowledges and starts
+-> upload stdout/stderr
+-> report result
+-> complete, retry, fail, or cancel
+-> release worker capacity
+```
+
+## CLI example
+
+The Compose CLI runs inside the cluster network:
 
 ```powershell
 docker compose --profile tools run --rm --no-deps cli submit /examples/success.json
-docker compose --profile tools run --rm --no-deps cli jobs
-docker compose --profile tools run --rm --no-deps cli workers
 ```
 
-When running the executable directly, its default URL is `http://127.0.0.1:8080`. Override it with `--coordinator-url` or `ORCHESTRAML_COORDINATOR_URL`.
+Example input:
+
+```json
+{
+  "name": "successful-container",
+  "execution": {
+    "type": "container",
+    "image": "alpine:3.21",
+    "command": ["echo", "hello"]
+  },
+  "priority": 10,
+  "timeout_seconds": 30,
+  "max_attempts": 2,
+  "retry": {
+    "initial_delay_seconds": 1,
+    "multiplier": 2,
+    "maximum_delay_seconds": 4,
+    "retry_timeouts": false
+  },
+  "required_labels": ["shared"],
+  "resources": {
+    "cpu_millicores": 100,
+    "memory_mib": 32
+  }
+}
+```
+
+Human-readable output:
 
 ```text
-orchestraml submit <job.json> [--idempotency-key KEY]
-orchestraml jobs [--status STATUS] [--limit N] [--cursor CURSOR]
+8df31a68-9d54-4bc8-a8f2-88f447e4ee38  pending             successful-container
+```
+
+List jobs:
+
+```powershell
+docker compose --profile tools run --rm --no-deps cli jobs
+```
+
+```text
+8df31a68-9d54-4bc8-a8f2-88f447e4ee38  completed           successful-container
+```
+
+Read or follow its logs:
+
+```powershell
+docker compose --profile tools run --rm --no-deps cli logs 8df31a68-9d54-4bc8-a8f2-88f447e4ee38 --follow
+```
+
+```text
+[5e80cc8a-4664-47de-b93b-e50afe27ef70 #1 stdout] hello
+```
+
+Add `--json` to any command for machine-readable output:
+
+```powershell
+docker compose --profile tools run --rm --no-deps cli status --json 8df31a68-9d54-4bc8-a8f2-88f447e4ee38
+```
+
+Main commands:
+
+```text
+orchestraml submit <job.json>
+orchestraml jobs
 orchestraml status <job-id>
 orchestraml attempts <job-id>
 orchestraml events <job-id>
-orchestraml logs <job-id> [--attempt ATTEMPT_ID] [--follow]
+orchestraml logs <job-id> [--follow]
 orchestraml cancel <job-id>
 orchestraml workers
 orchestraml worker <worker-id>
 ```
 
-Add `--json` to any command for machine-readable output. `submit -` reads JSON from standard input. CLI exit codes are: `2` invalid local input/response, `3` rejected request, `4` not found, `5` conflict, `6` transport unavailable, and `1` unexpected server failure.
+More ready-to-run definitions are in [`examples/`](examples/).
 
-`logs <job-id>` reads attempts in order. `--attempt` selects one exact attempt. `--follow` reconnects from the last sequence and continues when a retry creates another attempt.
+## Documentation map
 
-## Job behavior
+Start with the system overview:
 
-Job JSON explicitly defines execution, timeout, total maximum attempts, retry policy, labels, and resources. See [examples](examples/) for safe definitions.
+- [Data flow](lib/_Dataflow.md)
 
-- Higher priority jobs rank first; submission time and job ID break ties deterministically.
-- Only healthy workers satisfying effective labels, free slots, CPU, and memory are eligible.
-- Container jobs automatically require `docker`; submitted labels are not rewritten.
-- Reservations are persisted before an assignment is returned.
-- Retry delay is capped exponential backoff.
-- Cancellation and timeout terminate and reap the process/container before releasing the worker slot.
-- Offline or missing-worker attempts become lost and may be retried.
-- Container metadata records creation, start, finish, removal, and cleanup failure independently from attempt state.
+Core rules:
 
-## Execution guarantee
+- [Domain library](lib/domain/_Domain.md)
+- [Validated values](lib/domain/foundation/_Foundation.md)
+- [Typed identifiers](lib/domain/identifiers/_Identifiers.md)
+- [Shared policies and structures](lib/domain/shared/_Shared.md)
+- [Jobs, attempts, workers, and scheduling](lib/domain/core/_Core.md)
 
-Orchestraml provides **at-least-once execution**, not exactly-once execution. During uncertain worker or network failure, a replacement attempt may start before it is possible to prove the old computation never produced an external side effect.
+Coordinator and storage:
 
-Jobs with external side effects should be idempotent: use the job ID as an output key, check existing output, use transactions, or write temporary output before committing it. Submission idempotency prevents duplicate job records; it does not change execution semantics.
+- [Application layer](lib/application/_Application.md)
+- [Application ports](lib/application/ports/_Ports.md)
+- [Application services](lib/application/services/_Services.md)
+- [In-memory persistence](lib/application/memory/_Memory.md)
+- [Infrastructure](lib/infrastructure/_Infrastructure.md)
+- [PostgreSQL adapter](lib/infrastructure/postgres/_Postgres.md)
+- [Runtime configuration](lib/infrastructure/runtime/_Runtime.md)
+- [Coordinator](lib/coordinator/_Coordinator.md)
+- [HTTP API](lib/coordinator/api/_Api.md)
+- [JSON DTOs](lib/coordinator/dto/_Dto.md)
+- [HTTP server](lib/coordinator/server/_Server.md)
 
-## Logs and observability
+Worker and user tools:
 
-Workers assign one increasing sequence across stdout and stderr, upload bounded idempotent batches, and apply backpressure instead of silently dropping output. Stored logs survive coordinator restart. SSE following supports replay and reconnect.
+- [Worker](lib/worker/_Worker.md)
+- [Worker agent](lib/worker/agent/_Agent.md)
+- [Coordinator client](lib/worker/client/_Client.md)
+- [Executors](lib/worker/executor/_Executor.md)
+- [Durable logging pipeline](lib/worker/logging/_Logging.md)
+- [Worker runtime](lib/worker/runtime/_Runtime.md)
+- [CLI](lib/cli/_Cli.md)
+- [Operational logging](lib/observability/_Observability.md)
 
-```text
-GET /health
-GET /metrics
-GET /v1/attempts/{attempt_id}/logs
-GET /v1/attempts/{attempt_id}/logs/follow
-```
+Tests:
 
-`/metrics` uses Prometheus text exposition and includes job states, worker health, retries, average terminal duration, active attempts, and incomplete container cleanup. Coordinator and worker operational events are JSON lines with timestamps, severity, component, event name, and relevant entity IDs. Credentials, environment configuration, job output, and job payloads are not operational log fields.
+- [Controlled test support](test/support/_Support.md)
 
-## Configuration
+## Verification
 
-Coordinator essentials:
-
-- `DATABASE_URL` required.
-- `LISTEN_ADDRESS` default `127.0.0.1`; `PORT` default `8080`.
-- `DB_POOL_SIZE` default `10`.
-- `MIGRATIONS_DIR` default `migrations`.
-- Scheduler and retry intervals default to 1 second; maintenance defaults to 5 seconds.
-- Worker suspect/offline thresholds default to 30/60 seconds.
-- Assignment acknowledgement timeout defaults to 30 seconds.
-- Execution-report and heartbeat-recovery grace default to 10/20 seconds.
-
-Worker essentials:
-
-- `COORDINATOR_URL` and `WORKER_NAME` required.
-- `WORKER_LABELS`, concurrency, CPU millicores, and memory MiB define advertised capacity.
-- Identity defaults to `/var/lib/orchestraml/worker-id` and must be persisted.
-- Heartbeat, assignment, and control polling intervals are configurable.
-- Docker and durable-log buffer/batch settings are validated at startup.
-
-Secrets belong in environment variables or mounted secret files, never job definitions or source control.
-
-## Testing and demonstration
-
-Unit and property tests in the pinned toolchain:
+Run the OCaml tests:
 
 ```powershell
 docker build -f Dockerfile.dev -t orchestraml-dev:phase7 .
 docker run --rm orchestraml-dev:phase7 opam exec -- dune runtest --force
 ```
 
-Focused suites:
-
-```powershell
-./scripts/test-integration.ps1
-./scripts/test-reliability.ps1
-./scripts/test-container-logs.ps1
-./scripts/demo.ps1 -Clean
-```
-
-Complete release acceptance:
+Run the complete release acceptance suite:
 
 ```powershell
 ./scripts/test-release.ps1
 ```
 
-The release runner builds and tests the OCaml code, exercises PostgreSQL concurrency and restart, injects worker/coordinator failures, validates Docker execution and logs, runs the three-worker CLI demonstration, checks the Git diff, and cleans test resources.
+The focused integration scripts are under [`scripts/`](scripts/).
 
-## Troubleshooting and cleanup
+## Current limits
 
-```powershell
-docker compose ps
-docker compose logs coordinator worker-general worker-data worker-local postgres
-docker ps -a --filter label=orchestraml.managed=true
-```
+This release is intended for trusted local or internal environments. It has no authentication or TLS and must not be exposed to an untrusted network. Two demonstration workers mount the Docker socket, which gives them authority over the local Docker engine.
 
-Stop while preserving data and identities:
-
-```powershell
-docker compose --profile tools down
-```
-
-Destructively remove local database and worker identities:
-
-```powershell
-docker compose --profile tools down --volumes --remove-orphans
-```
-
-Malformed identity files are intentionally not replaced. Fix or explicitly remove the affected identity volume. If a Docker worker cannot access the engine, verify Docker Desktop and socket permissions; it will remain available for local commands but will not advertise `docker`.
-
-## Limitations
-
-Version one supports a single active coordinator and trusted HTTP communication. It does not include authentication, TLS, exactly-once execution, multi-coordinator leadership, Kubernetes, workflows, cron scheduling, a web UI, registry credentials, production secret distribution, host mounts, privileged job containers, or a durable worker-side log spool.
-
-Engineering references: [_Plan.md](_Plan.md), [_Requirements.md](_Requirements.md), and the concise module documents under [`lib/`](lib/).
+The first release also excludes multi-coordinator leadership, exactly-once execution, Kubernetes, workflows, cron scheduling, a web UI, registry credentials, host mounts, and privileged job containers.
